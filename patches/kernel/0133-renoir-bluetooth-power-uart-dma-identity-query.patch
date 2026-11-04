@@ -1,0 +1,289 @@
+--- /dev/null
++++ b/bsd/dev/renoir_bluetooth_hci.inc
+@@ -0,0 +1,254 @@
++/* QCA6490 Bluetooth: power-up, HS-UART in SE DMA mode and one identity query.
++ * MiCode a9244def, in its own order:
++ *  - btpower.c bt_configure_gpios(on): BT_EN (GPIO65) out-low, 50 ms; WLAN_EN
++ *    high -> BT_EN high (else 100 ms more, then high); 50 ms; read SW_CTRL (91).
++ *    Rails: the DT bt-vdd-* minimums (io 1.8V smpb10; aon/dig/rfacmn/rfa0p8
++ *    0.95V smpc2; rfa1 1.88V smpb11; rfa2 1.35V smpb12; asd 2.8V ldoc11) equal
++ *    the shared apps-DRV votes renoir_wifi_power() made and retains, so the
++ *    aggregate already covers this consumer; nothing here lowers a rail.
++ *  - pinctrl "active" for qupv3_se15: GPIO68/71 qup15 bias-disable, 69 qup15
++ *    pull-down, 70 qup15 pull-up, 2 mA (pinctrl-shima: qup15 = function 1).
++ *  - msm_geni_serial_port_setup (non-console: SE_DMA, packing 8/4/lsb),
++ *    geni_se_init (rx_wm=depth/2, rfr=depth-2), geni_se_select_dma_mode,
++ *    set_termios 115200 8N1 CRTSCTS with HALF_SAMPLING (16x): SE7 7.3728 MHz,
++ *    divider 4; start_rx_sequencer (RX DMA 2048 bytes, S_CMD START_READ with
++ *    RFR_OPEN); setup_tx + geni_se_tx_dma_prep.
++ *  - DMA buffers through the wrapper's apps-SMMU stream 0x4c3 (DT iommus,
++ *    qcom,iommu-dma-addr-pool 0x40000000), mapped like the Wi-Fi SID2401 bank.
++ *  - The query is btqca qca_read_soc_version's EDL_PATCH_VER_REQ (H4 01,
++ *    opcode 0xfc00, 1 byte 0x19), waited for HCI_INIT_TIMEOUT (10 s).
++ * Not native: completion is polled (no SE/GPIO wake IRQ is registered yet);
++ * no patch/NVM download; no iOS transport. Afterwards the RX sequencer is
++ * stopped (stop_rx_sequencer), BT_EN goes low (100 ms, btpower off), the SID
++ * is detached and the UART clocks/bus votes are released. */
++#define BT_IOVA 0x40000000ULL
++#define BT_DMA_BYTES 0x4000u
++static struct {
++    vm_offset_t smmu,cb,buffer,tables,nc;
++    uint64_t pa,table_pa;
++    unsigned slot,bank,asid;
++    uint32_t old_smr,old_s2cr,saved_sctlr;
++    bool published;
++} bts;
++static void bt_wr(vm_offset_t base,unsigned off,uint32_t value)
++{
++    __asm__ volatile("dmb oshst" ::: "memory");
++    *(volatile uint32_t *)(base+off)=value;
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++static void bt_sleep_ms(unsigned ms)
++{
++    uint64_t deadline;clock_interval_to_deadline(ms,NSEC_PER_MSEC,&deadline);
++    (void)assert_wait_deadline(&bts,THREAD_UNINT,deadline);thread_block(THREAD_CONTINUE_NULL);
++}
++#define BT_FAIL(label) do { printf("STAR BT SMMU GATE: %s line=%u\n",label,(unsigned)__LINE__);return false; } while(0)
++static bool bt_smmu_prepare_locked(void)
++{
++    bts.smmu=ml_io_map(0x15000000,0x2000);if(!bts.smmu) BT_FAIL("SMMU map failed");
++    if(wdrd(bts.smmu,0x20)!=0x4c017e59 || wdrd(bts.smmu,0x24)!=0x6000003c || wdrd(bts.smmu,0x28)!=0x5111 ||
++       (wdrd(bts.smmu,0)&9) || !(wdrd(bts.smmu,0)&(1u<<10))) BT_FAIL("unsupported SMMU state");
++    bool used[60]={false};unsigned free_slot=89;
++    for(unsigned i=0;i<89;++i) {
++        uint32_t smr=wdrd(bts.smmu,0x800+4*i),s2cr=wdrd(bts.smmu,0xc00+4*i);
++        if(!(smr>>31)) {if(free_slot==89) free_slot=i;continue;}
++        if(((s2cr>>16)&3)==0 && (s2cr&255)<60) used[s2cr&255]=true;
++        if(!(((smr&0x7fff)^0x4c3)&~((smr>>16)&0x7fff))) {
++            printf("STAR BT SMMU: SID 0x4c3 already matched by slot %u smr=%#x s2cr=%#x\n",i,smr,s2cr);
++            BT_FAIL("existing stream owner");
++        }
++    }
++    if(free_slot==89) BT_FAIL("no free SMR");bts.slot=free_slot;
++    vm_offset_t banks=ml_io_map(0x15080000,60u<<12);if(!banks) BT_FAIL("context bank map failed");
++    for(bts.bank=0;bts.bank<60;++bts.bank)
++        if(!used[bts.bank] && !(wdrd(banks,bts.bank<<12)&1u) && !(wdrd(banks,(bts.bank<<12)+0x58)&0xc00001feu) &&
++           !wdrd(bts.smmu,0x1000+4*bts.bank) && !wdrd(bts.smmu,0x1800+4*bts.bank)) break;
++    if(bts.bank==60) BT_FAIL("no unused clean context bank");
++    bts.cb=banks+(bts.bank<<12);
++    for(bts.asid=254;bts.asid>0;--bts.asid) {
++        bool taken=false;
++        for(unsigned i=0;i<60;++i) if(used[i] || (wdrd(banks,i<<12)&1u))
++            if((wdrd(banks,(i<<12)+0x24)>>16)==bts.asid || (wdrd(banks,(i<<12)+0x2c)>>16)==bts.asid) taken=true;
++        if(!taken) break;
++    }
++    if(!bts.asid) BT_FAIL("no collision-free ASID");
++    if(kmem_alloc_contig(kernel_map,&bts.buffer,BT_DMA_BYTES,PAGE_MASK,0,0,KMA_DATA|KMA_ZERO|KMA_PERMANENT,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS ||
++       kmem_alloc_contig(kernel_map,&bts.tables,0x4000,PAGE_MASK,0,0,KMA_DATA|KMA_ZERO|KMA_PERMANENT,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS) BT_FAIL("allocation");
++    ppnum_t bp=pmap_find_phys(kernel_pmap,(addr64_t)bts.buffer),tp=pmap_find_phys(kernel_pmap,(addr64_t)bts.tables);
++    if(!bp || !tp) BT_FAIL("physical address");
++    bts.pa=ptoa_64(bp);bts.table_pa=ptoa_64(tp);
++    if((bts.pa&0x3fff) || (bts.table_pa&0x3fff) || bts.pa+BT_DMA_BYTES>(1ULL<<36) || bts.table_pa+0x4000>(1ULL<<36)) BT_FAIL("alignment/range");
++    for(unsigned page=0;page<BT_DMA_BYTES/0x1000;++page)
++        if(ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)(bts.buffer+0x1000ULL*page)))!=bts.pa+0x1000ULL*page) BT_FAIL("not contiguous");
++    flush_dcache64((addr64_t)bts.table_pa,0x4000,TRUE);
++    flush_dcache64((addr64_t)bts.pa,BT_DMA_BYTES,TRUE);
++    vm_offset_t tables=ml_io_map_unmappable(bts.table_pa,0x4000,VM_WIMG_WCOMB);
++    bts.nc=ml_io_map_unmappable(bts.pa,BT_DMA_BYTES,VM_WIMG_WCOMB);
++    if(!tables || !bts.nc) BT_FAIL("NC mapping");
++    /* 0x40000000: L1 index 1, L2 index 0, one leaf table (4 KiB pages). */
++    uint64_t *l1=(uint64_t *)tables,*l2=(uint64_t *)(tables+0x1000),*leaf=(uint64_t *)(tables+0x2000);
++    l1[1]=(bts.table_pa+0x1000)|3;l2[0]=(bts.table_pa+0x2000)|3;
++    for(unsigned i=0;i<BT_DMA_BYTES/0x1000;++i) leaf[i]=(bts.pa+0x1000ULL*i)|(3ULL<<53)|0xe43;
++    __asm__ volatile("dsb sy" ::: "memory");
++    if(l1[1]!=((bts.table_pa+0x1000)|3) || l2[0]!=((bts.table_pa+0x2000)|3) || (leaf[0]&0xffffff000ULL)!=bts.pa) BT_FAIL("table readback");
++    bts.old_smr=wdrd(bts.smmu,0x800+4*bts.slot);bts.old_s2cr=wdrd(bts.smmu,0xc00+4*bts.slot);
++    bts.saved_sctlr=wdrd(bts.cb,0);
++    wdwr(bts.smmu,0x1800+4*bts.bank,1);wdwr(bts.smmu,0x1000+4*bts.bank,0x1f300);
++    wdwr(bts.cb,0x10,0x38011);wdwr(bts.cb,0x30,0x802020);
++    uint64_t ttbr=bts.table_pa|((uint64_t)bts.asid<<48);
++    wdwr64(bts.cb,0x20,ttbr);wdwr64(bts.cb,0x28,0);
++    if(wdrd64(bts.cb,0x20)!=ttbr) BT_FAIL("TTBR readback");
++    wdwr(bts.cb,0x38,0x44);wdwr(bts.cb,0x3c,0);
++    wdwr(bts.cb,0x610,bts.asid);wdwr(bts.cb,0x7f0,0xffffffffu);
++    unsigned us;for(us=0;us<10000 && (wdrd(bts.cb,0x7f4)&1);++us) delay(1);
++    if(us==10000) BT_FAIL("TLB sync");
++    wdwr(bts.cb,0,0x00c01027u);
++    bts.published=true;
++    wdwr(bts.smmu,0xc00+4*bts.slot,0x300|bts.bank);wdwr(bts.smmu,0x800+4*bts.slot,0x800004c3);
++    if(wdrd(bts.smmu,0xc00+4*bts.slot)!=(0x300|bts.bank) || wdrd(bts.smmu,0x800+4*bts.slot)!=0x800004c3) BT_FAIL("SID publication");
++    printf("STAR BT SMMU: SID0x4c3 slot%u CB%u ASID%u IOVA=%#llx bytes=%#x\n",bts.slot,bts.bank,bts.asid,BT_IOVA,BT_DMA_BYTES);
++    return true;
++}
++#undef BT_FAIL
++/* arm_smmu_destroy_domain_context order: detach the stream, then disable the bank. */
++static void bt_smmu_retire_locked(void)
++{
++    if(!bts.published) return;
++    wdwr(bts.smmu,0x800+4*bts.slot,bts.old_smr);wdwr(bts.smmu,0xc00+4*bts.slot,bts.old_s2cr);
++    wdwr(bts.cb,0,0);wdwr(bts.cb,0x610,bts.asid);wdwr(bts.cb,0x7f0,0xffffffffu);
++    for(unsigned us=0;us<10000 && (wdrd(bts.cb,0x7f4)&1);++us) delay(1);
++    bts.published=false;
++    printf("STAR BT SMMU: retired slot%u CB%u SMR=%#x\n",bts.slot,bts.bank,wdrd(bts.smmu,0x800+4*bts.slot));
++}
++/* TLMM pin windows; ml_io_map is permanent, so each pin is mapped once. */
++static vm_offset_t bt_gpio(unsigned pin)
++{
++    static const unsigned pins[]={64,65,68,69,70,71,91};static vm_offset_t maps[7];
++    for(unsigned i=0;i<7;++i) if(pins[i]==pin) {
++        if(!maps[i]) maps[i]=ml_io_map(0x0f100000+pin*0x1000,0x1000);
++        return maps[i];
++    }
++    return 0;
++}
++static void bt_gpio_cfg(unsigned pin,uint32_t cfg)
++{
++    vm_offset_t g=bt_gpio(pin);
++    if(g) bt_wr(g,0,cfg);
++}
++static uint32_t bt_gpio_in(unsigned pin)
++{
++    vm_offset_t g=bt_gpio(pin);
++    return g?(rd(g,4)&1):0xff;
++}
++static void bt_gpio_out(unsigned pin,unsigned value)
++{
++    vm_offset_t g=bt_gpio(pin);
++    if(!g) return;
++    bt_wr(g,4,value?2:0);
++    bt_wr(g,0,(rd(g,0)&~0x3cu)|(1u<<9));    /* function gpio, output enable */
++}
++static void bt_hex(const char *what,vm_offset_t data,unsigned n)
++{
++    char line[3*64+1];unsigned k=0;
++    for(unsigned i=0;i<n && i<64;++i) {
++        static const char hx[]="0123456789abcdef";uint8_t b=*(volatile uint8_t *)(data+i);
++        line[k++]=hx[b>>4];line[k++]=hx[b&15];line[k++]=' ';
++    }
++    line[k]=0;printf("STAR BT %s: %u bytes: %s\n",what,n,line);
++}
++static void renoir_bluetooth_hci_run(void *arg __unused,wait_result_t result __unused)
++{
++    struct star_gpu_icc *core=NULL,*ddr=NULL;
++    vm_offset_t uart=0;unsigned clocks=0;int e=0;bool powered=false,rx_started=false,smmu=false;
++    const enum star_gpu_clock_id order[]={STAR_CLK_QUP0_M_AHB,STAR_CLK_QUP0_S_AHB,STAR_CLK_SE7};
++    unsigned wl=bt_gpio_in(64);
++    printf("STAR BT POWER: rails=shared Wi-Fi votes (BT minimums equal); WLAN_EN=%u SW_CTRL=%u before\n",wl,bt_gpio_in(91));
++    if(wl!=1) {printf("STAR BT POWER: WLAN_EN not high; no BT power-up\n");goto done;}
++    /* bt_en_sleep pinctrl: gpio, 2 mA, pull-down, output-low */
++    bt_gpio_cfg(65,1u|(1u<<9));bt_gpio_out(65,0);bt_sleep_ms(50);
++    bt_gpio_out(65,1);powered=true;bt_sleep_ms(50);
++    printf("STAR BT POWER: BT_EN=%u SW_CTRL=%u after 50 ms\n",bt_gpio_in(65),bt_gpio_in(91));
++    /* qupv3_se15 active pinctrl */
++    bt_gpio_cfg(68,1u<<2);bt_gpio_cfg(71,1u<<2);bt_gpio_cfg(69,(1u<<2)|1u);bt_gpio_cfg(70,(1u<<2)|3u);
++    e=star_gpu_clock_qup0_open();if(e)goto done;
++    e=star_gpu_icc_get_qup0(&core,&ddr);if(e)goto done;
++    e=star_gpu_icc_set(core,50000,100000);if(e)goto done;
++    e=star_gpu_icc_set(ddr,0,76800);if(e)goto done;
++    e=star_gpu_clock_set_rate(STAR_CLK_SE7,7372800);if(e)goto done;
++    for(;clocks<3;clocks++){e=star_gpu_clock_prepare_enable(order[clocks]);if(e)goto done;}
++    uart=ml_io_map_unmappable(0x99c000,0x4000,VM_WIMG_IO);if(!uart){e=ENOMEM;goto done;}
++    if(((rd(uart,0x68)>>8)&255)!=2){e=ENXIO;goto done;}
++    renoir_dma_lock();smmu=bt_smmu_prepare_locked();renoir_dma_unlock();
++    if(!smmu){e=EIO;goto done;}
++    unsigned depth=(rd(uart,0xe28)>>16)&63;
++    /* port_setup */
++    bt_wr(uart,0x294,160);                                   /* RX_STALE_CNT = 10 bits * 16 */
++    bt_wr(uart,0x260,0x4380e);bt_wr(uart,0x264,0xc3e0e);     /* TX packing 8/4 */
++    bt_wr(uart,0x284,0x4380e);bt_wr(uart,0x288,0xc3e0e);     /* RX packing 8/4 */
++    /* geni_se_init: se_io_init, se_io_set_mode, rfr/wm, common IRQ enables */
++    bt_wr(uart,0x28,rd(uart,0x28)|0x7f);bt_wr(uart,0xe30,rd(uart,0xe30)|0xf);
++    bt_wr(uart,0x24,0x7f);bt_wr(uart,0x20,1);
++    bt_wr(uart,0xe1c,rd(uart,0xe1c)|0xf);bt_wr(uart,0x258,rd(uart,0x258)&~1u);bt_wr(uart,0xe18,0);
++    bt_wr(uart,0x810,depth/2);bt_wr(uart,0x814,depth-2);
++    bt_wr(uart,0x614,rd(uart,0x614)|0x7eu|(1u<<22)|(1u<<23)|(1u<<24)|(1u<<25)|(1u<<28)|(1u<<29));
++    bt_wr(uart,0x644,rd(uart,0x644)|0x3eu|0x3e00u|(1u<<24)|(1u<<25));
++    /* geni_se_select_dma_mode (UART keeps its M IRQ enables) */
++    bt_wr(uart,0xe18,0);bt_wr(uart,0x618,~0u);bt_wr(uart,0x648,~0u);bt_wr(uart,0xc44,~0u);bt_wr(uart,0xd44,~0u);
++    bt_wr(uart,0xe1c,~0u);bt_wr(uart,0x258,rd(uart,0x258)|1u);
++    /* set_termios 115200 8N1 CRTSCTS: 7.3728 MHz / (115200*16) = 4 */
++    bt_wr(uart,0x48,1u|(4u<<4));bt_wr(uart,0x4c,1u|(4u<<4));(void)rd(uart,0x48);
++    bt_wr(uart,0x22c,0);
++    bt_wr(uart,0x25c,rd(uart,0x25c)&~3u);bt_wr(uart,0x2a4,rd(uart,0x2a4)&~1u);
++    bt_wr(uart,0x280,rd(uart,0x280)&~(1u<<3));bt_wr(uart,0x2a8,rd(uart,0x2a8)&~1u);
++    bt_wr(uart,0x268,8);bt_wr(uart,0x28c,8);bt_wr(uart,0x26c,0);bt_wr(uart,0x2ac,0);
++    /* start_rx_sequencer: RX DMA 2048 bytes at IOVA+0x1000, START_READ | RFR_OPEN */
++    bt_wr(uart,0xd4c,7);bt_wr(uart,0xd30,(uint32_t)(BT_IOVA+0x1000));bt_wr(uart,0xd34,(uint32_t)((BT_IOVA+0x1000)>>32));
++    bt_wr(uart,0xd38,0);bt_wr(uart,0xd3c,2048);
++    bt_wr(uart,0x630,(1u<<27)|(1u<<7));rx_started=true;                 /* geni_setup_s_cmd */
++    printf("STAR BT UART: 115200 8N1 CRTSCTS SE_DMA depth=%u status=%#x clk=%u\n",depth,rd(uart,0x40),star_gpu_clock_get_rate(STAR_CLK_SE7));
++    /* EDL_PATCH_VER_REQ: H4 01, opcode fc00, length 1, 0x19 */
++    static const uint8_t cmd[]={0x01,0x00,0xfc,0x01,0x19};
++    for(unsigned i=0;i<sizeof(cmd);++i) *(volatile uint8_t *)(bts.nc+i)=cmd[i];
++    __asm__ volatile("dsb sy" ::: "memory");
++    bt_wr(uart,0x270,sizeof(cmd));bt_wr(uart,0x600,1u<<27);
++    bt_wr(uart,0xc4c,7);bt_wr(uart,0xc30,(uint32_t)BT_IOVA);bt_wr(uart,0xc34,(uint32_t)(BT_IOVA>>32));
++    bt_wr(uart,0xc38,1);bt_wr(uart,0xc3c,sizeof(cmd));
++    unsigned ms;
++    for(ms=0;ms<10000 && !(rd(uart,0xc40)&1);++ms) bt_sleep_ms(1);
++    uint32_t txs=rd(uart,0xc40);bt_wr(uart,0xc44,txs);bt_wr(uart,0x618,rd(uart,0x610));
++    printf("STAR BT TX: EDL_PATCH_VER_REQ done=%u ms=%u tx_irq=%#x geni=%#x\n",txs&1,ms,txs,rd(uart,0x40));
++    if(!(txs&1)) {e=ETIMEDOUT;goto done;}
++    for(ms=0;ms<10000 && !(rd(uart,0xd40)&3);++ms) bt_sleep_ms(1);  /* DMA_DONE | EOT */
++    uint32_t rxs=rd(uart,0xd40),len=rd(uart,0xd54);bt_wr(uart,0xd44,rxs);
++    printf("STAR BT RX: irq=%#x len=%u ms=%u s_irq=%#x\n",rxs,len,ms,rd(uart,0x640));
++    if(rxs&3) bt_hex("RX EVENT",bts.nc+0x1000,len>2048?2048:len);
++    else e=ETIMEDOUT;
++done:
++    if(uart && rx_started) {
++        /* stop_rx_sequencer: manual flow off, cancel S command, RX DMA FSM reset */
++        bt_wr(uart,0x2ac,(1u<<31)|(1u<<1));delay(1500);
++        bt_wr(uart,0x634,1u<<2);
++        for(unsigned us=0;us<10000 && (rd(uart,0x40)&(1u<<12));us+=10) delay(10);
++        bt_wr(uart,0x648,rd(uart,0x640));
++        bt_wr(uart,0xd58,1);
++        for(unsigned us=0;us<10000 && !(rd(uart,0xd40)&(1u<<3));us+=10) delay(10);
++        bt_wr(uart,0xd44,rd(uart,0xd40));bt_wr(uart,0xe1c,0);
++    }
++    if(powered) {bt_gpio_out(65,0);bt_sleep_ms(100);}
++    if(smmu||bts.published){renoir_dma_lock();bt_smmu_retire_locked();renoir_dma_unlock();}
++    while(clocks)star_gpu_clock_disable_unprepare(order[--clocks]);
++    int cleanup=0;
++    if(core){cleanup=star_gpu_icc_set(core,0,0);star_gpu_icc_put(core);}
++    if(ddr){int r=star_gpu_icc_set(ddr,0,0);if(r)cleanup=r;star_gpu_icc_put(ddr);}
++    if(uart) bt_unmap(uart,0x4000);
++    printf("STAR BT HCI SUMMARY: error=%d cleanup=%d powered_then_off=%u smmu=%u; identity query only, no patch/NVM, no iOS transport\n",e,cleanup,powered,smmu);
++    thread_terminate_self();
++}
++static void renoir_bluetooth_hci_start(void)
++{
++    int enabled=1;
++    PE_parse_boot_argn("renoirbt",&enabled,sizeof(enabled));
++    if(!enabled) return;
++    thread_t thread;
++    if(kernel_thread_start(renoir_bluetooth_hci_run,NULL,&thread)==KERN_SUCCESS) thread_deallocate(thread);
++    else printf("STAR BT HCI: worker not started\n");
++}
+--- a/bsd/dev/renoir_bluetooth_probe.inc
++++ b/bsd/dev/renoir_bluetooth_probe.inc
+@@ -13,6 +13,8 @@
+ {
+     if(address)ml_io_unmap(trunc_page(address),round_page(size+(address-trunc_page(address))));
+ }
++/* After the Wi-Fi service is resident (renoir_bluetooth_hci.inc). */
++static void renoir_bluetooth_hci_start(void);
+ static void renoir_bluetooth_uart_probe(void)
+ {
+     int enabled=1;
+--- a/bsd/dev/renoir_wifi.c
++++ b/bsd/dev/renoir_wifi.c
+@@ -44,6 +44,7 @@
+ 
+ #include "renoir_bluetooth_probe.inc"
+ #include "renoir_pcie_start.inc"
++#include "renoir_bluetooth_hci.inc"
+ 
+ static void
+ renoir_wifi_run(void)
+--- a/bsd/dev/renoir_wifi_qrtr_probe.inc
++++ b/bsd/dev/renoir_wifi_qrtr_probe.inc
+@@ -204,6 +204,8 @@
+             os_atomic_store(&wfr.state,2,release);
+             printf("STAR WIFI SERVICE ONLINE: INIT_DONE=1 WLAN_CFG=1 SRNG=1 RX_posted=1 NORMAL=1 HTC_READY=1 WMI_CONNECTED=1 HTT_CONNECTED=1 HTC_SETUP_SUBMITTED=1 WMI_READY=1 HOST_MAC=1 HTT_VERSION_REQUESTED=1 RXDMA_SETUP_SUBMITTED=1 owner retained; polling control transport, no WLAN network yet\n");
+             (void)sweet_log_checkpoint();
++            /* btpower needs WLAN_EN high and the shared rails: start BT once here. */
++            renoir_bluetooth_hci_start();
+         }
+         if(wm.phase==2 && resident && !wc_scan_tick(bar,ms,stopping)) {good=false;break;}
+         if(wm.phase==2 && resident && !stopping && !wc_sta_tick(bar,ms)) {good=false;break;}

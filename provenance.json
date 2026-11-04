@@ -1,0 +1,110 @@
+{
+  "source_commit": "161a1ba60f2d4528caf784b09730d6217a819ca1",
+  "exported_files": [
+    {
+      "path": "kernel/files/bsd/dev/renoir_bluetooth_probe.inc",
+      "source_path": "gpu/kernel-files/bsd/dev/renoir_bluetooth_probe.inc",
+      "source_sha256": "e1e710b9c94be2de5edd08bdc1c12cee7d7b31e655004b3414828317f3d38ed9",
+      "export_sha256": "e1e710b9c94be2de5edd08bdc1c12cee7d7b31e655004b3414828317f3d38ed9",
+      "change": "byte-identical"
+    },
+    {
+      "path": "kernel/files/bsd/dev/renoir_bluetooth_hci.inc",
+      "source_path": "gpu/kernel-files/bsd/dev/renoir_bluetooth_hci.inc",
+      "source_sha256": "027108d7e05770811752b1bbbb46fff4bd8048a3d999d2167b06f53844413871",
+      "export_sha256": "027108d7e05770811752b1bbbb46fff4bd8048a3d999d2167b06f53844413871",
+      "change": "byte-identical"
+    },
+    {
+      "path": "kernel/files/bsd/dev/renoir_bluetooth_transport.inc",
+      "source_path": "gpu/kernel-files/bsd/dev/renoir_bluetooth_transport.inc",
+      "source_sha256": "228c4f681e59f485b911651f0ca24cdb54cc61ea79d59cb7af53b71ab6b8785e",
+      "export_sha256": "228c4f681e59f485b911651f0ca24cdb54cc61ea79d59cb7af53b71ab6b8785e",
+      "change": "byte-identical"
+    },
+    {
+      "path": "userland/renoir_bluetool.c",
+      "source_path": "userland/renoir_bluetool.c",
+      "source_sha256": "03d37d7d251a8131f0cf47a73a5c333e996cf67f3b38b11b79ab9d71953d56a7",
+      "export_sha256": "03d37d7d251a8131f0cf47a73a5c333e996cf67f3b38b11b79ab9d71953d56a7",
+      "change": "byte-identical"
+    },
+    {
+      "path": "userland/renoir_bt_type0.c",
+      "source_path": "userland/renoir_bt_type0.c",
+      "source_sha256": "bb66ba844f06ccbba1702399f52191fc53154af94e2db224dd7f6fd7630af479",
+      "export_sha256": "bb66ba844f06ccbba1702399f52191fc53154af94e2db224dd7f6fd7630af479",
+      "change": "byte-identical"
+    },
+    {
+      "path": "tools/patch-renoir-bluetoothd.py",
+      "source_path": "workspace-tools/patch-renoir-bluetoothd.py",
+      "source_sha256": "d7fa6e4d9f976b1a065c997017590342e1d6d28a963dcd32012aaed19268ec59",
+      "export_sha256": "d7fa6e4d9f976b1a065c997017590342e1d6d28a963dcd32012aaed19268ec59",
+      "change": "byte-identical"
+    },
+    {
+      "path": "tools/install-userland.py",
+      "source_path": "workspace-tools/install-renoir-bluetool.py",
+      "source_sha256": "28efe7a0aac68952869ae4e9d9e4c7e21ca1b02eb69eb2cd5a91a6fa56bf6857",
+      "export_sha256": "bd664ae59a5a42021567c54754843a4ca24818d1d420586f97af74b59b0b7f47",
+      "change": "repository-relative paths/messages only"
+    },
+    {
+      "path": "tools/collect-firmware.py",
+      "source_path": "workspace-tools/collect-renoir-bt-firmware.py",
+      "source_sha256": "2cd5f7e86ec39b2944d23f6d7aab1adb4994127f32d45ff687989006488b4743",
+      "export_sha256": "8bfc645e573a854b696ec23140c10f73388f66c15b246eeba5c369d88f9274ab",
+      "change": "repository-relative paths/messages only"
+    },
+    {
+      "path": "tests/bluetooth_h4_parser.c",
+      "source_path": "gpu/tests/bluetooth_h4_parser.c",
+      "source_sha256": "b9f71b3982df0c036d6dcb88c10b216c47ce96544370c4b004529e400f2e67b6",
+      "export_sha256": "b9f71b3982df0c036d6dcb88c10b216c47ce96544370c4b004529e400f2e67b6",
+      "change": "byte-identical"
+    },
+    {
+      "path": "tests/bluetooth_worker_sim.c",
+      "source_path": "gpu/tests/bluetooth_worker_sim.c",
+      "source_sha256": "4983ead9f0c07badd4f22b4b3fbcb1dc004aa7dca6f56118f7a9e0250a03da63",
+      "export_sha256": "4983ead9f0c07badd4f22b4b3fbcb1dc004aa7dca6f56118f7a9e0250a03da63",
+      "change": "byte-identical"
+    },
+    {
+      "path": "tests/test_bluetooth_h4_parser.py",
+      "source_path": "gpu/tests/test_bluetooth_h4_parser.py",
+      "source_sha256": "77c3005fbb0e93fde0e73fa0d857e9b294244255554d15b922ee17830c2f9c8e",
+      "export_sha256": "098ea2dabc416ad8f7c530c45fcdc1f16cffc1f92757c858226e296eae59aee6",
+      "change": "repository-relative paths/messages only"
+    },
+    {
+      "path": "tests/test_bluetooth_worker_sim.py",
+      "source_path": "gpu/tests/test_bluetooth_worker_sim.py",
+      "source_sha256": "514ec1051830e928244b9aee976634447a67d50a6215537d5d0d162af9768c05",
+      "export_sha256": "259f996764fb70e369fcef30346442bc6fc528889dd48591fef8fc63873563ab",
+      "change": "repository-relative paths/messages only"
+    },
+    {
+      "path": "tests/test_bluetooth_type0_advertising.py",
+      "source_path": "gpu/tests/test_bluetooth_type0_advertising.py",
+      "source_sha256": "7cef3930c10870fc4e69dae1ce4d29f4cd2bf9e85ac1df4755c20fe694648415",
+      "export_sha256": "50c36748bb420a2daa20ef0009bb053d766d5b99c689b738f5c8b3e1c8c0b2b9",
+      "change": "repository-relative paths/messages only"
+    },
+    {
+      "path": "patches/history/0140-renoir-bluetooth-uart-power-preflight.patch",
+      "source_path": "xnu/patches/0140-renoir-bluetooth-uart-power-preflight.patch",
+      "source_sha256": "56814a980688830b64e3ce193824fcd86df2c30538493b05ab09bbdfa25c1380",
+      "export_sha256": "56814a980688830b64e3ce193824fcd86df2c30538493b05ab09bbdfa25c1380",
+      "change": "byte-identical"
+    },
+    {
+      "path": "LICENSES/APSL-2.0.txt",
+      "source_path": "linux-build/HACKIOS-LICENSE",
+      "source_sha256": "e5881019d8766c1e88a5fe1dbca4ba40c78011d41fcb18f6e9f50df60182685b",
+      "export_sha256": "e5881019d8766c1e88a5fe1dbca4ba40c78011d41fcb18f6e9f50df60182685b",
+      "change": "byte-identical"
+    }
+  ]
+}

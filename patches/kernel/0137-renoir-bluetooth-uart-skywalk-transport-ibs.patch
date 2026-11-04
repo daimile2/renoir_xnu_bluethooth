@@ -1,0 +1,531 @@
+--- /dev/null
++++ b/bsd/dev/renoir_bluetooth_transport.inc
+@@ -0,0 +1,362 @@
++/* iOS HCI transport for the QCA6490 UART: the D22 AppleOnboardSerial
++ * Skywalk interface, as used by 20H392 bluetoothd (transport-encoding 1).
++ * d22ap kernelcache AppleOnboardSerial:
++ *  - kernel control "com.apple.uart.sk.%s", CTL_FLAG_REG_SOCK_STREAM, not
++ *    privileged (bluetoothd runs as mobile); one client per port (connect
++ *    opens the port, a second open is busy); ctl_send is EOPNOTSUPP.
++ *  - SYSPROTO_CONTROL options: IOAOSSKYSETCHANNELSPEC 0x800c5414 (opened
++ *    port only; {buffer size: power of two <= 4096, slots 1..512, slots
++ *    1..512}, default {2048,16,16}; an existing interface is kept), get
++ *    spec 0x400c5413, nexus UUID 0x40105412 (not attached until a spec was
++ *    set), TIOCGETA/TIOCSETA on the 64-bit termios; others ENOPROTOOPT.
++ * bluetoothd sets {1024,63,63}, reads the UUID, os_channel_create(uuid,0)
++ * and moves the raw H4 byte stream through the slots (TX: memmove into
++ * slots, set_slot_properties, advance, sync; RX: kevent, then every slot).
++ * The nexus is XNU's kernel pipe (the utun kpipe pattern) instead of
++ * IOSkywalkFamily, which this kernel does not have; one pipe instance is
++ * bound to the pid that set the spec. Bytes are exchanged with the UART
++ * owner (renoir_bluetooth_hci.inc) through two FIFOs; as on a closed
++ * serial port, received bytes are discarded while no RX ring exists.
++ * kern.renoir_bt_boot blocks until the kernel finished the QCA bring-up
++ * (BlueTool's "boot" script role) and returns 0 or its error;
++ * kern.renoir_bt_firmware is the controller's EDL build label. */
++#include <sys/kern_control.h>
++#include <sys/sysctl.h>
++#include <sys/mbuf.h>
++#include <sys/mcache.h>
++#include <sys/proc.h>
++#include <uuid/uuid.h>
++#include <skywalk/os_skywalk.h>
++#define BT_SK_FIFO 8192u
++#define BT_SK_LINE_SPEED 115200u
++struct bt_termios64 {
++    uint64_t iflag,oflag,cflag,lflag;
++    uint8_t cc[20];
++    uint32_t pad;
++    uint64_t ispeed,ospeed;
++};
++static LCK_GRP_DECLARE(bt_sk_grp,"renoir.bt.uart.sk");
++static LCK_MTX_DECLARE(bt_sk_lock,&bt_sk_grp);
++static struct {
++    kern_ctl_ref ctl;
++    bool connected,creating,closing;
++    uint32_t unit,spec[3];
++    struct bt_termios64 termios;
++    nexus_controller_t ncd;
++    uuid_t provider,instance;
++    kern_pbufpool_t pool;
++    kern_channel_ring_t rxring,txring;
++    unsigned busy;
++    uint32_t rx_head,rx_len,tx_head,tx_len;
++    uint8_t rx[BT_SK_FIFO],tx[BT_SK_FIFO];
++    int boot;           /* -1 pending, 0 ready, else errno */
++    char firmware[64];
++    uint64_t rx_dropped;
++} bt_sk={.boot=-1,.spec={2048,16,16}};
++
++static void bt_sk_termios_default(void)
++{
++    memset(&bt_sk.termios,0,sizeof(bt_sk.termios));
++    /* The hardware line: 8N1, CREAD, RTS/CTS. */
++    bt_sk.termios.cflag=0x300|0x800|0x8000|0x10000|0x20000;
++    bt_sk.termios.ispeed=bt_sk.termios.ospeed=BT_SK_LINE_SPEED;
++}
++static void bt_sk_fifo_put(uint8_t *fifo,uint32_t head,uint32_t *len,const uint8_t *data,uint32_t n)
++{
++    for(uint32_t i=0;i<n;++i) fifo[(head+*len+i)%BT_SK_FIFO]=data[i];
++    *len+=n;
++}
++static void bt_sk_fifo_get(const uint8_t *fifo,uint32_t *head,uint32_t *len,uint8_t *data,uint32_t n)
++{
++    for(uint32_t i=0;i<n;++i) data[i]=fifo[(*head+i)%BT_SK_FIFO];
++    *head=(*head+n)%BT_SK_FIFO;*len-=n;
++}
++/* Ring notification outside the lock; disconnect drains these first. */
++static void bt_sk_notify(kern_channel_ring_t ring)
++{
++    if(!ring) {lck_mtx_unlock(&bt_sk_lock);return;}
++    ++bt_sk.busy;lck_mtx_unlock(&bt_sk_lock);
++    (void)kern_channel_notify(ring,0);
++    lck_mtx_lock(&bt_sk_lock);
++    if(!--bt_sk.busy && bt_sk.closing) wakeup(&bt_sk.busy);
++    lck_mtx_unlock(&bt_sk_lock);
++}
++
++/* UART owner side. */
++static uint32_t renoir_bt_sk_rx_space(void)
++{
++    lck_mtx_lock(&bt_sk_lock);
++    uint32_t space=bt_sk.rxring&&!bt_sk.closing?BT_SK_FIFO-bt_sk.rx_len:BT_SK_FIFO;
++    lck_mtx_unlock(&bt_sk_lock);
++    return space;
++}
++static void renoir_bt_sk_rx_put(const uint8_t *data,uint32_t n)
++{
++    if(!n) return;
++    lck_mtx_lock(&bt_sk_lock);
++    if(!bt_sk.rxring || bt_sk.closing || n>BT_SK_FIFO-bt_sk.rx_len) {
++        bt_sk.rx_dropped+=n;lck_mtx_unlock(&bt_sk_lock);return;
++    }
++    bt_sk_fifo_put(bt_sk.rx,bt_sk.rx_head,&bt_sk.rx_len,data,n);
++    bt_sk_notify(bt_sk.rxring);
++}
++static uint32_t renoir_bt_sk_tx_pending(void)
++{
++    lck_mtx_lock(&bt_sk_lock);
++    uint32_t n=bt_sk.tx_len;
++    lck_mtx_unlock(&bt_sk_lock);
++    return n;
++}
++static uint32_t renoir_bt_sk_tx_take(uint8_t *data,uint32_t max)
++{
++    lck_mtx_lock(&bt_sk_lock);
++    uint32_t n=bt_sk.tx_len<max?bt_sk.tx_len:max;
++    bt_sk_fifo_get(bt_sk.tx,&bt_sk.tx_head,&bt_sk.tx_len,data,n);
++    if(n && bt_sk.txring && !bt_sk.closing) bt_sk_notify(bt_sk.txring);
++    else lck_mtx_unlock(&bt_sk_lock);
++    return n;
++}
++
++/* Kernel pipe provider. */
++static errno_t bt_sk_pre_connect(kern_nexus_provider_t prov __unused,proc_t p __unused,kern_nexus_t nexus __unused,
++    nexus_port_t port __unused,kern_channel_t channel __unused,void **ctx __unused) {return 0;}
++static errno_t bt_sk_connected(kern_nexus_provider_t prov __unused,kern_nexus_t nexus __unused,kern_channel_t channel __unused)
++{
++    lck_mtx_lock(&bt_sk_lock);bt_sk.closing=false;lck_mtx_unlock(&bt_sk_lock);
++    return 0;
++}
++static void bt_sk_pre_disconnect(kern_nexus_provider_t prov __unused,kern_nexus_t nexus __unused,kern_channel_t channel __unused)
++{
++    lck_mtx_lock(&bt_sk_lock);
++    bt_sk.closing=true;
++    while(bt_sk.busy) (void)msleep(&bt_sk.busy,&bt_sk_lock,PZERO,"btsk",NULL);
++    lck_mtx_unlock(&bt_sk_lock);
++}
++static void bt_sk_disconnected(kern_nexus_provider_t prov __unused,kern_nexus_t nexus __unused,kern_channel_t channel __unused) {}
++static errno_t bt_sk_ring_init(kern_nexus_provider_t prov __unused,kern_nexus_t nexus __unused,kern_channel_t channel __unused,
++    kern_channel_ring_t ring,boolean_t is_tx,void **ctx __unused)
++{
++    lck_mtx_lock(&bt_sk_lock);
++    if(is_tx) bt_sk.txring=ring; else bt_sk.rxring=ring;
++    lck_mtx_unlock(&bt_sk_lock);
++    return 0;
++}
++static void bt_sk_ring_fini(kern_nexus_provider_t prov __unused,kern_nexus_t nexus __unused,kern_channel_ring_t ring)
++{
++    lck_mtx_lock(&bt_sk_lock);
++    if(bt_sk.txring==ring) bt_sk.txring=NULL;
++    if(bt_sk.rxring==ring) bt_sk.rxring=NULL;
++    lck_mtx_unlock(&bt_sk_lock);
++}
++/* Host -> controller: whole slots into the TX FIFO; a slot that does not fit
++ * stays in the ring until the UART owner drains the FIFO and notifies. */
++static errno_t bt_sk_sync_tx(kern_nexus_provider_t prov __unused,kern_nexus_t nexus __unused,kern_channel_ring_t ring,uint32_t flags __unused)
++{
++    kern_channel_slot_t prev=NULL,slot;
++    lck_mtx_lock(&bt_sk_lock);
++    for(slot=kern_channel_get_next_slot(ring,NULL,NULL);slot && !bt_sk.closing;slot=kern_channel_get_next_slot(ring,slot,NULL)) {
++        kern_packet_t ph=kern_channel_slot_get_packet(ring,slot);
++        if(ph) {
++            kern_buflet_t buf=kern_packet_get_next_buflet(ph,NULL);
++            uint32_t n=kern_packet_get_data_length(ph);
++            if(n>BT_SK_FIFO-bt_sk.tx_len) break;
++            const uint8_t *data=(const uint8_t *)kern_buflet_get_data_address(buf)+kern_buflet_get_data_offset(buf);
++            bt_sk_fifo_put(bt_sk.tx,bt_sk.tx_head,&bt_sk.tx_len,data,n);
++        }
++        prev=slot;
++    }
++    if(prev) {kern_channel_advance_slot(ring,prev);(void)kern_channel_reclaim(ring);}
++    lck_mtx_unlock(&bt_sk_lock);
++    if(prev) wakeup(&bt_sk);
++    return 0;
++}
++/* Controller -> host: the RX FIFO into freshly allocated slot packets. */
++static errno_t bt_sk_sync_rx(kern_nexus_provider_t prov __unused,kern_nexus_t nexus,kern_channel_ring_t ring,uint32_t flags __unused)
++{
++    kern_channel_slot_t prev=NULL,slot;kern_pbufpool_t pool=NULL;
++    if(kern_nexus_get_pbufpool(nexus,NULL,&pool) || !pool) return 0;
++    lck_mtx_lock(&bt_sk_lock);
++    (void)kern_channel_reclaim(ring);
++    for(slot=kern_channel_get_next_slot(ring,NULL,NULL);slot && bt_sk.rx_len && !bt_sk.closing;slot=kern_channel_get_next_slot(ring,slot,NULL)) {
++        kern_packet_t ph=0;
++        if(kern_pbufpool_alloc_nosleep(pool,1,&ph)) break;
++        kern_buflet_t buf=kern_packet_get_next_buflet(ph,NULL);
++        uint32_t n=bt_sk.rx_len<bt_sk.spec[0]?bt_sk.rx_len:bt_sk.spec[0];
++        bt_sk_fifo_get(bt_sk.rx,&bt_sk.rx_head,&bt_sk.rx_len,kern_buflet_get_data_address(buf),n);
++        kern_packet_clear_flow_uuid(ph);
++        VERIFY(!kern_buflet_set_data_offset(buf,0));
++        VERIFY(!kern_buflet_set_data_length(buf,n));
++        VERIFY(!kern_packet_finalize(ph));
++        VERIFY(!kern_channel_slot_attach_packet(ring,slot,ph));
++        prev=slot;
++    }
++    if(prev) kern_channel_advance_slot(ring,prev);
++    lck_mtx_unlock(&bt_sk_lock);
++    if(prev) wakeup(&bt_sk);
++    return 0;
++}
++
++static void bt_sk_destroy(nexus_controller_t ncd,const uuid_t provider,const uuid_t instance,kern_pbufpool_t pool)
++{
++    if(!uuid_is_null(instance)) (void)kern_nexus_controller_free_provider_instance(ncd,instance);
++    if(pool) kern_pbufpool_destroy(pool);
++    if(!uuid_is_null(provider)) (void)kern_nexus_controller_deregister_provider(ncd,provider);
++    if(ncd) kern_nexus_controller_destroy(ncd);
++}
++static errno_t bt_sk_create(const uint32_t spec[3],pid_t pid,nexus_controller_t *ncdp,uuid_t provider,uuid_t instance,kern_pbufpool_t *poolp)
++{
++    nexus_controller_t ncd=NULL;nexus_attr_t attr=NULL;kern_pbufpool_t pool=NULL;uuid_t domain;
++    uuid_clear(provider);uuid_clear(instance);
++    errno_t e=kern_nexus_controller_create(&ncd);
++    if(!e) e=kern_nexus_get_default_domain_provider(NEXUS_TYPE_KERNEL_PIPE,&domain);
++    if(!e) e=kern_nexus_attr_create(&attr);
++    if(!e) e=kern_nexus_attr_set(attr,NEXUS_ATTR_SLOT_BUF_SIZE,spec[0]);
++    if(!e) e=kern_nexus_attr_set(attr,NEXUS_ATTR_TX_SLOTS,spec[1]);
++    if(!e) e=kern_nexus_attr_set(attr,NEXUS_ATTR_RX_SLOTS,spec[2]);
++    if(!e) {
++        struct kern_nexus_provider_init init={
++            .nxpi_version=KERN_NEXUS_DOMAIN_PROVIDER_CURRENT_VERSION,.nxpi_flags=NXPIF_VIRTUAL_DEVICE,
++            .nxpi_pre_connect=bt_sk_pre_connect,.nxpi_connected=bt_sk_connected,
++            .nxpi_pre_disconnect=bt_sk_pre_disconnect,.nxpi_disconnected=bt_sk_disconnected,
++            .nxpi_ring_init=bt_sk_ring_init,.nxpi_ring_fini=bt_sk_ring_fini,
++            .nxpi_sync_tx=bt_sk_sync_tx,.nxpi_sync_rx=bt_sk_sync_rx,
++        };
++        e=kern_nexus_controller_register_provider(ncd,domain,(const uint8_t *)"com.apple.uart.sk.bluetooth",&init,sizeof(init),attr,(uuid_t *)provider);
++    }
++    if(attr) kern_nexus_attr_destroy(attr);
++    if(!e) {
++        struct kern_pbufpool_init pp={.kbi_version=KERN_PBUFPOOL_CURRENT_VERSION,.kbi_flags=KBIF_VIRTUAL_DEVICE|KBIF_QUANTUM,
++            .kbi_packets=(spec[1]+spec[2])*2,.kbi_bufsize=spec[0],.kbi_max_frags=1};
++        (void)snprintf((char *)pp.kbi_name,sizeof(pp.kbi_name),"com.apple.kpipe.uart.bluetooth");
++        e=kern_pbufpool_create(&pp,&pool,NULL);
++    }
++    if(!e) {
++        struct kern_nexus_init init={.nxi_version=KERN_NEXUS_CURRENT_VERSION,.nxi_tx_pbufpool=pool};
++        e=kern_nexus_controller_alloc_provider_instance(ncd,provider,NULL,NULL,(uuid_t *)instance,&init);
++    }
++    if(!e) {
++        nexus_port_t port=NEXUS_PORT_KERNEL_PIPE_CLIENT;
++        e=kern_nexus_controller_bind_provider_instance(ncd,instance,&port,pid,NULL,NULL,0,NEXUS_BIND_PID);
++    }
++    if(e) {bt_sk_destroy(ncd,provider,instance,pool);return e;}
++    *ncdp=ncd;*poolp=pool;
++    return 0;
++}
++
++/* Kernel control. */
++static errno_t bt_sk_connect(kern_ctl_ref ref __unused,struct sockaddr_ctl *sac,void **unitinfo)
++{
++    lck_mtx_lock(&bt_sk_lock);
++    if(bt_sk.connected) {lck_mtx_unlock(&bt_sk_lock);return EBUSY;}
++    bt_sk.connected=true;bt_sk.unit=sac->sc_unit;*unitinfo=&bt_sk;
++    bt_sk_termios_default();
++    lck_mtx_unlock(&bt_sk_lock);
++    printf("STAR BT UART.SK: connect unit=%u pid=%d\n",sac->sc_unit,proc_pid(current_proc()));
++    return 0;
++}
++static errno_t bt_sk_disconnect(kern_ctl_ref ref __unused,u_int32_t unit,void *unitinfo __unused)
++{
++    lck_mtx_lock(&bt_sk_lock);
++    if(!bt_sk.connected || bt_sk.unit!=unit) {lck_mtx_unlock(&bt_sk_lock);return 0;}
++    nexus_controller_t ncd=bt_sk.ncd;kern_pbufpool_t pool=bt_sk.pool;uuid_t provider,instance;
++    uuid_copy(provider,bt_sk.provider);uuid_copy(instance,bt_sk.instance);
++    bt_sk.ncd=NULL;bt_sk.pool=NULL;uuid_clear(bt_sk.provider);uuid_clear(bt_sk.instance);
++    lck_mtx_unlock(&bt_sk_lock);
++    if(ncd) bt_sk_destroy(ncd,provider,instance,pool);
++    lck_mtx_lock(&bt_sk_lock);
++    printf("STAR BT UART.SK: disconnect unit=%u rx_dropped=%llu\n",unit,bt_sk.rx_dropped);
++    bt_sk.connected=bt_sk.closing=false;
++    bt_sk.rx_head=bt_sk.rx_len=bt_sk.tx_head=bt_sk.tx_len=0;
++    bt_sk.spec[0]=2048;bt_sk.spec[1]=bt_sk.spec[2]=16;
++    lck_mtx_unlock(&bt_sk_lock);
++    return 0;
++}
++static errno_t bt_sk_send(kern_ctl_ref ref __unused,u_int32_t unit __unused,void *unitinfo __unused,mbuf_t m,int flags __unused)
++{
++    mbuf_freem(m);
++    return EOPNOTSUPP;
++}
++static errno_t bt_sk_setopt(kern_ctl_ref ref __unused,u_int32_t unit __unused,void *unitinfo __unused,int opt,void *data,size_t len)
++{
++    if((uint32_t)opt==0x800c5414u) {             /* IOAOSSKYSETCHANNELSPEC */
++        if(len!=12) return EINVAL;
++        const uint32_t *spec=data;
++        lck_mtx_lock(&bt_sk_lock);
++        if(bt_sk.ncd) {lck_mtx_unlock(&bt_sk_lock);return 0;}
++        if(bt_sk.creating) {lck_mtx_unlock(&bt_sk_lock);return EBUSY;}
++        if(!spec[0] || (spec[0]&(spec[0]-1)) || spec[0]>4096 || spec[1]-1>=512 || spec[2]-1>=512) {
++            lck_mtx_unlock(&bt_sk_lock);return EINVAL;
++        }
++        memcpy(bt_sk.spec,spec,12);bt_sk.creating=true;
++        lck_mtx_unlock(&bt_sk_lock);
++        nexus_controller_t ncd=NULL;kern_pbufpool_t pool=NULL;uuid_t provider,instance;
++        pid_t pid=proc_pid(current_proc());
++        errno_t e=bt_sk_create(spec,pid,&ncd,provider,instance,&pool);
++        lck_mtx_lock(&bt_sk_lock);
++        bt_sk.creating=false;
++        if(!e) {bt_sk.ncd=ncd;bt_sk.pool=pool;uuid_copy(bt_sk.provider,provider);uuid_copy(bt_sk.instance,instance);}
++        lck_mtx_unlock(&bt_sk_lock);
++        printf("STAR BT UART.SK: channel spec buf=%u slots=%u/%u pid=%d error=%d\n",spec[0],spec[1],spec[2],pid,e);
++        return e?ENXIO:0;
++    }
++    if((uint32_t)opt==0x80487414u) {             /* TIOCSETA */
++        if(len!=sizeof(struct bt_termios64)) return EINVAL;
++        const struct bt_termios64 *t=data;
++        /* The line is fixed at 8N1 RTS/CTS and the speed the NVM selected. */
++        bool ok=(t->cflag&(0x300|0x400|0x1000))==0x300 && (t->cflag&0x30000)==0x30000 &&
++            t->ispeed==BT_SK_LINE_SPEED && t->ospeed==BT_SK_LINE_SPEED;
++        printf("STAR BT UART.SK: TIOCSETA cflag=%#llx speed=%llu/%llu %s\n",t->cflag,t->ispeed,t->ospeed,ok?"accepted":"unsupported");
++        if(!ok) return EINVAL;
++        lck_mtx_lock(&bt_sk_lock);bt_sk.termios=*t;lck_mtx_unlock(&bt_sk_lock);
++        return 0;
++    }
++    return ENOPROTOOPT;
++}
++static errno_t bt_sk_getopt(kern_ctl_ref ref __unused,u_int32_t unit __unused,void *unitinfo __unused,int opt,void *data,size_t *len)
++{
++    errno_t e=0;
++    lck_mtx_lock(&bt_sk_lock);
++    if((uint32_t)opt==0x400c5413u) {              /* channel spec */
++        if(*len<12) e=EINVAL; else {memcpy(data,bt_sk.spec,12);*len=12;}
++    } else if((uint32_t)opt==0x40105412u) {       /* nexus UUID */
++        if(*len<sizeof(uuid_t)) e=EINVAL;
++        else if(!bt_sk.ncd) e=ENXIO;
++        else {memcpy(data,bt_sk.instance,sizeof(uuid_t));*len=sizeof(uuid_t);}
++    } else if((uint32_t)opt==0x40487413u) {       /* TIOCGETA */
++        if(*len<sizeof(struct bt_termios64)) e=EINVAL;
++        else {memcpy(data,&bt_sk.termios,sizeof(struct bt_termios64));*len=sizeof(struct bt_termios64);}
++    } else e=ENOPROTOOPT;
++    lck_mtx_unlock(&bt_sk_lock);
++    return e;
++}
++
++static int bt_sk_boot_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp,arg1,arg2)
++    int error=0,value;
++    lck_mtx_lock(&bt_sk_lock);
++    while(bt_sk.boot<0 && !error) error=msleep(&bt_sk.boot,&bt_sk_lock,PZERO|PCATCH,"btboot",NULL);
++    value=bt_sk.boot;
++    lck_mtx_unlock(&bt_sk_lock);
++    return error?error:SYSCTL_OUT(req,&value,sizeof(value));
++}
++SYSCTL_PROC(_kern,OID_AUTO,renoir_bt_boot,CTLTYPE_INT|CTLFLAG_RD|CTLFLAG_LOCKED,NULL,0,bt_sk_boot_sysctl,"I","QCA6490 kernel bring-up result");
++SYSCTL_STRING(_kern,OID_AUTO,renoir_bt_firmware,CTLFLAG_RD|CTLFLAG_LOCKED,bt_sk.firmware,sizeof(bt_sk.firmware),"QCA6490 firmware build label");
++
++/* Called once by the UART owner: 0 after a complete bring-up, else errno. */
++static void renoir_bt_sk_boot_result(int error,const char *firmware)
++{
++    if(!error) {
++        struct kern_ctl_reg reg={.ctl_flags=CTL_FLAG_REG_SOCK_STREAM,
++            .ctl_connect=bt_sk_connect,.ctl_disconnect=bt_sk_disconnect,.ctl_send=bt_sk_send,
++            .ctl_setopt=bt_sk_setopt,.ctl_getopt=bt_sk_getopt};
++        strlcpy(reg.ctl_name,"com.apple.uart.sk.bluetooth",sizeof(reg.ctl_name));
++        error=ctl_register(&reg,&bt_sk.ctl);
++        printf("STAR BT UART.SK: ctl_register com.apple.uart.sk.bluetooth error=%d firmware=%s\n",error,firmware);
++    }
++    lck_mtx_lock(&bt_sk_lock);
++    if(firmware) strlcpy(bt_sk.firmware,firmware,sizeof(bt_sk.firmware));
++    bt_sk.boot=error;
++    lck_mtx_unlock(&bt_sk_lock);
++    wakeup(&bt_sk.boot);
++}
+--- a/bsd/dev/renoir_wifi.c
++++ b/bsd/dev/renoir_wifi.c
+@@ -44,6 +44,7 @@
+ 
+ #include "renoir_bluetooth_probe.inc"
+ #include "renoir_pcie_start.inc"
++#include "renoir_bluetooth_transport.inc"
+ #include "renoir_bluetooth_hci.inc"
+ 
+ static void
+--- a/bsd/dev/renoir_bluetooth_hci.inc
++++ b/bsd/dev/renoir_bluetooth_hci.inc
+@@ -30,10 +30,21 @@
+  *    acked; qca_disable_soc_logging; HCI_Reset; qca_read_fw_build_info.
+  *    The files come from this phone's bluetooth_a partition via the boot
+  *    bundle (bt-hpbtfw20.tlv, bt-hpnv20.bin).
+- * Not native: completion is polled (no SE/GPIO wake IRQ is registered yet);
+- * no patch/NVM download; no iOS transport. Afterwards the RX sequencer is
+- * stopped (stop_rx_sequencer), BT_EN goes low (100 ms, btpower off), the SID
+- * is detached and the UART clocks/bus votes are released. */
++ * After a complete setup hci_qca clears QCA_IBS_DISABLED with both IBS
++ * states ASLEEP and the UART stays owned (bt_service): H4 frames are
++ * reassembled as qca_recv_pkts (ACL/SCO/event/ISO + the three IBS bytes),
++ * ACL debug logs (QCA_DEBUG_HANDLE) go to diag, not the host; host bytes
++ * follow qca_enqueue (ASLEEP -> WAKE_IND, WAKING until WAKE_ACK with the
++ * 100 ms wake_retrans; AWAKE re-arms the 2000 ms tx_idle_delay, whose
++ * expiry sends SLEEP_IND); a device WAKE_IND is acknowledged, SLEEP_IND
++ * marks RX asleep. The iOS side is renoir_bluetooth_transport.inc.
++ * Not native: completion is polled (no SE/GPIO wake IRQ is registered yet),
++ * so the service polls every 1 ms; the serial clock votes of the IBS states
++ * are not applied (clocks stay on); no memdump/SSR handling. RX DMA is only
++ * re-armed with 2048 bytes of FIFO space (RFR flow control holds the
++ * controller meanwhile). On a failed setup the RX sequencer is stopped
++ * (stop_rx_sequencer), BT_EN goes low (100 ms, btpower off), the SID is
++ * detached and the UART clocks/bus votes are released. */
+ #define BT_IOVA 0x40000000ULL
+ #define BT_DMA_BYTES 0x4000u
+ static struct {
+@@ -251,6 +262,85 @@
+     }
+     printf("STAR BT %s: %u bytes in %u segments acked\n",name,size,segments);
+     return 0;
++}
++static void bt_service_sleep(void)
++{
++    uint64_t deadline;clock_interval_to_deadline(1,NSEC_PER_MSEC,&deadline);
++    (void)assert_wait_deadline(&bt_sk,THREAD_UNINT,deadline);thread_block(THREAD_CONTINUE_NULL);
++}
++#define HCI_IBS_SLEEP_IND 0xfe
++#define HCI_IBS_WAKE_IND 0xfd
++#define HCI_IBS_WAKE_ACK 0xfc
++#define QCA_DEBUG_HANDLE 0x2edc
++static __attribute__((noreturn)) void bt_service(vm_offset_t uart)
++{
++    enum {TX_ASLEEP,TX_WAKING,TX_AWAKE} tx_ibs=TX_ASLEEP;
++    bool rx_awake=false,armed=false;
++    uint8_t type=0,hdr[4];unsigned need=0,got=0,body=0;bool drop=false;
++    static uint8_t out[0x1000],in[2048];
++    uint64_t retrans=0,idle=0,retrans_ticks,idle_ticks;
++    nanoseconds_to_absolutetime(100*NSEC_PER_MSEC,&retrans_ticks);
++    nanoseconds_to_absolutetime(2000*NSEC_PER_MSEC,&idle_ticks);
++    uint64_t wakes=0,wacks=0,slps=0,recv_wakes=0,recv_wacks=0,recv_slps=0,diag=0,bad=0;
++    printf("STAR BT SERVICE: UART owned, IBS tx/rx ASLEEP, wake_retrans=100 ms tx_idle=2000 ms, 1 ms poll\n");
++    for(;;) {
++        unsigned n_out=0;
++        if(!armed && renoir_bt_sk_rx_space()>=2048) {bt_rx_arm(uart);armed=true;}
++        uint32_t rxs=rd(uart,0xd40);
++        if(armed && (rxs&3)) {
++            unsigned len=rd(uart,0xd54);bt_wr(uart,0xd44,rxs);armed=false;
++            if(len>2048) len=2048;
++            for(unsigned i=0;i<len;++i) in[i]=*(volatile uint8_t *)(bts.nc+0x1000+i);
++            for(unsigned i=0;i<len;) {
++                if(!need && !body) {
++                    uint8_t b=in[i++];
++                    if(b==HCI_IBS_WAKE_IND) {
++                        ++recv_wakes;rx_awake=true;out[n_out++]=HCI_IBS_WAKE_ACK;++wacks;
++                    } else if(b==HCI_IBS_SLEEP_IND) {++recv_slps;rx_awake=false;}
++                    else if(b==HCI_IBS_WAKE_ACK) {
++                        ++recv_wacks;
++                        if(tx_ibs==TX_WAKING) {tx_ibs=TX_AWAKE;idle=mach_absolute_time()+idle_ticks;}
++                    } else if(b==2 || b==5) {type=b;need=4;got=0;}
++                    else if(b==3) {type=b;need=3;got=0;}
++                    else if(b==4) {type=b;need=2;got=0;}
++                    else {
++                        /* h4_recv_buf: unknown type -> -EILSEQ, rest of the buffer dropped */
++                        ++bad;printf("STAR BT SERVICE: unknown H4 type %#x, %u bytes dropped\n",b,len-i+1);break;
++                    }
++                    continue;
++                }
++                if(need) {
++                    hdr[got++]=in[i++];
++                    if(got<need) continue;
++                    need=0;
++                    body=type==4?hdr[1]:type==3?hdr[2]:type==2?(unsigned)(hdr[2]|(hdr[3]<<8)):(unsigned)((hdr[2]|(hdr[3]<<8))&0x3fff);
++                    drop=type==2 && (hdr[0]|(hdr[1]<<8))==QCA_DEBUG_HANDLE;
++                    if(drop) ++diag;
++                    else {renoir_bt_sk_rx_put(&type,1);renoir_bt_sk_rx_put(hdr,got);}
++                    continue;
++                }
++                unsigned n=len-i<body?len-i:body;
++                if(!drop) renoir_bt_sk_rx_put(in+i,n);
++                i+=n;body-=n;
++            }
++        }
++        uint64_t now=mach_absolute_time();
++        if(tx_ibs==TX_WAKING && now>=retrans) {out[n_out++]=HCI_IBS_WAKE_IND;++wakes;retrans=now+retrans_ticks;}
++        if(tx_ibs==TX_AWAKE && now>=idle) {out[n_out++]=HCI_IBS_SLEEP_IND;++slps;tx_ibs=TX_ASLEEP;}
++        if(renoir_bt_sk_tx_pending()) {
++            if(tx_ibs==TX_ASLEEP) {
++                tx_ibs=TX_WAKING;out[n_out++]=HCI_IBS_WAKE_IND;++wakes;retrans=now+retrans_ticks;
++            } else if(tx_ibs==TX_AWAKE) {
++                n_out+=renoir_bt_sk_tx_take(out+n_out,sizeof(out)-n_out);
++                idle=now+idle_ticks;
++            }
++        }
++        if(n_out && bt_tx(uart,out,n_out))
++            printf("STAR BT SERVICE: TX of %u bytes failed (IBS sent wake=%llu wack=%llu sleep=%llu recv wake=%llu wack=%llu sleep=%llu rx_awake=%u)\n",
++                n_out,wakes,wacks,slps,recv_wakes,recv_wacks,recv_slps,rx_awake);
++        if(bad || diag) {printf("STAR BT SERVICE: diag ACL=%llu bad frames=%llu\n",diag,bad);bad=diag=0;}
++        bt_service_sleep();
++    }
+ }
+ static void renoir_bluetooth_hci_run(void *arg __unused,wait_result_t result __unused)
+ {
+@@ -331,9 +421,21 @@
+             if(!e) {const uint8_t p[2]={0x14,0x00};e=bt_cmd(uart,0xfc17,p,2,-1,"DISABLE_SOC_LOGGING");}
+             if(!e) e=bt_cmd(uart,0x0c03,NULL,0,-1,"HCI_RESET");
+             if(!e) e=bt_edl(uart,0x20,"EDL_GET_BUILD_INFO");
++            if(!e) {
++                /* qca_read_fw_build_info: data[0] is the label length */
++                char label[64];unsigned n=bt_ev(8),len=bt_ev(2)+3;
++                if(n>sizeof(label)-1) n=sizeof(label)-1;
++                if(9+n>len) n=len>9?len-9:0;
++                for(unsigned i=0;i<n;++i) label[i]=(char)bt_ev(9+i);
++                label[n]=0;
++                printf("STAR BT HCI SUMMARY: rampatch/NVM/HCI_Reset at 115200 done; firmware %s; UART kept for iOS\n",label);
++                renoir_bt_sk_boot_result(0,label);
++                bt_service(uart);
++            }
+         }
+     }
+ done:
++    renoir_bt_sk_boot_result(e?e:EIO,NULL);
+     if(uart && rx_started) {
+         /* stop_rx_sequencer: manual flow off, cancel S command, RX DMA FSM reset */
+         bt_wr(uart,0x2ac,(1u<<31)|(1u<<1));delay(1500);
+@@ -351,15 +453,15 @@
+     if(core){cleanup=star_gpu_icc_set(core,0,0);star_gpu_icc_put(core);}
+     if(ddr){int r=star_gpu_icc_set(ddr,0,0);if(r)cleanup=r;star_gpu_icc_put(ddr);}
+     if(uart) bt_unmap(uart,0x4000);
+-    printf("STAR BT HCI SUMMARY: error=%d cleanup=%d powered_then_off=%u smmu=%u; rampatch/NVM/HCI_Reset at 115200, then off; no iOS transport, no iOS transport\n",e,cleanup,powered,smmu);
++    printf("STAR BT HCI SUMMARY: error=%d cleanup=%d powered_then_off=%u smmu=%u; setup failed, no iOS transport\n",e,cleanup,powered,smmu);
+     thread_terminate_self();
+ }
+ static void renoir_bluetooth_hci_start(void)
+ {
+     int enabled=1;
+     PE_parse_boot_argn("renoirbt",&enabled,sizeof(enabled));
+-    if(!enabled) return;
++    if(!enabled) {renoir_bt_sk_boot_result(ENODEV,NULL);return;}
+     thread_t thread;
+     if(kernel_thread_start(renoir_bluetooth_hci_run,NULL,&thread)==KERN_SUCCESS) thread_deallocate(thread);
+-    else printf("STAR BT HCI: worker not started\n");
+-}
++    else {printf("STAR BT HCI: worker not started\n");renoir_bt_sk_boot_result(ENOMEM,NULL);}
++}

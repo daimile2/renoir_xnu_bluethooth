@@ -1,0 +1,16 @@
+/private/
+/build/
+/firmware/
+/artifacts/
+/logs/
+*.img
+*.bin
+*.tlv
+*.dylib
+*.ips
+*.tracev3
+*.logarchive/
+__pycache__/
+*.pyc
+.venv/
+.DS_Store

@@ -1,0 +1,143 @@
+--- a/bsd/dev/renoir_bluetooth_hci.inc
++++ b/bsd/dev/renoir_bluetooth_hci.inc
+@@ -467,7 +467,8 @@
+     uint8_t ctrl[16];unsigned ctrl_len;
+     uint8_t cmd[4+255];unsigned cmd_len;
+     uint16_t wait_opcode;
+-    uint8_t ev[3+255];unsigned ev_len;             /* H4 event packet, ev[0]=4 */
++    uint8_t ev[3+255];unsigned ev_len;             /* H4 event packet being parsed, ev[0]=4 */
++    uint8_t reply[3+255];unsigned reply_len;       /* the waited command's complete event */
+     /* h4_recv_buf state */
+     uint8_t type,hdr[4];unsigned need,got,body;bool drop;
+     uint8_t fwd[2048];unsigned fwd_len,fwd_off;
+@@ -495,6 +496,7 @@
+ static void bt_event(void)
+ {
+     if(bw.waiting && !bw.done && bw.ev[1]==0x0e && bw.ev_len>=6 && (bw.ev[4]|(bw.ev[5]<<8))==bw.wait_opcode) {
++        memcpy(bw.reply,bw.ev,bw.ev_len);bw.reply_len=bw.ev_len;
+         bw.done=true;return;
+     }
+     if(bw.service) {bt_stage(bw.ev,bw.ev_len);return;}
+@@ -585,9 +587,8 @@
+         bt_sk_kicks_tx,bt_sk_kicks_rx,bt_sk.rx_dropped);
+     lck_mtx_unlock(&bu_lock);
+ }
+-/* One worker pass: RX, IBS deadlines, TX; then sleep until a signal or the
+- * earliest of `deadline` (0: none) and the armed IBS deadline. */
+-static void bt_pump(uint64_t deadline)
++/* One worker pass: RX, IBS deadlines, TX. */
++static void bt_step(void)
+ {
+     bt_rx_process();
+     uint64_t now=mach_absolute_time();
+@@ -619,6 +620,11 @@
+     }
+     uint64_t errors=bu.parity+bu.brk+bu.overrun+bu.sbe+bu.illegal+bw.bad;
+     if(errors!=bw.last_errors) {bw.last_errors=errors;bt_stats("error");}
++}
++/* Sleep until a signal or the earliest of `deadline` (0: none) and the armed
++ * IBS deadline; signals that arrived since the last pass are still counted. */
++static void bt_wait(uint64_t deadline)
++{
+     uint64_t next=deadline;
+     if(bw.ibs && bw.tx_ibs==TX_WAKING && (!next || bw.retrans<next)) next=bw.retrans;
+     if(bw.ibs && bw.tx_ibs==TX_AWAKE && (!next || bw.idle<next)) next=bw.idle;
+@@ -626,14 +632,25 @@
+     if(!next) (void)semaphore_wait(bt_work);
+     else if(semaphore_wait_deadline(bt_work,next)==KERN_OPERATION_TIMED_OUT) ++bw.timeouts;
+ }
++/* Work, then the caller's condition, and only then a wait. */
++static bool bt_run(bool (*done)(void),uint64_t deadline)
++{
++    for(;;) {
++        bt_step();
++        if(done()) return true;
++        if(mach_absolute_time()>=deadline) return false;
++        bt_wait(deadline);
++    }
++}
++static bool bt_cmd_queued(void) {return !bw.cmd_len;}
++static bool bt_cmd_completed(void) {return bw.done;}
++static bool bt_tx_drained(void) {return bu_tx_empty();}
+ /* __hci_cmd_send: queued once the previous command left for the UART. */
+ static int bt_send(const uint8_t *packet,unsigned n,uint64_t deadline)
+ {
+-    while(bw.cmd_len && mach_absolute_time()<deadline) bt_pump(deadline);
+-    if(bw.cmd_len) return ETIMEDOUT;
++    if(!bt_run(bt_cmd_queued,deadline)) return ETIMEDOUT;
+     memcpy(bw.cmd,packet,n);bw.cmd_len=n;
+-    while(bw.cmd_len && mach_absolute_time()<deadline) bt_pump(deadline);
+-    return bw.cmd_len?ETIMEDOUT:0;
++    return bt_run(bt_cmd_queued,deadline)?0:ETIMEDOUT;
+ }
+ /* __hci_cmd_sync_ev(event 0): command complete for opcode in HCI_INIT_TIMEOUT;
+  * status 0 (and the EDL rtype when given). */
+@@ -643,14 +660,14 @@
+     packet[0]=1;packet[1]=opcode&255;packet[2]=opcode>>8;packet[3]=n;
+     for(unsigned i=0;i<n;++i) packet[4+i]=params[i];
+     uint64_t start=mach_absolute_time(),deadline;clock_interval_to_deadline(10000,NSEC_PER_MSEC,&deadline);
+-    bw.wait_opcode=opcode;bw.done=false;bw.waiting=true;
++    bw.wait_opcode=opcode;bw.done=false;bw.reply_len=0;bw.waiting=true;
+     int e=bt_send(packet,4+n,deadline);
+-    while(!e && !bw.done && mach_absolute_time()<deadline) bt_pump(deadline);
++    if(!e) (void)bt_run(bt_cmd_completed,deadline);
+     bw.waiting=false;
+     uint64_t ns;absolutetime_to_nanoseconds(mach_absolute_time()-start,&ns);
+     if(!bw.done) {printf("STAR BT RX: %s no command complete in %llu ms%s\n",name,ns/NSEC_PER_MSEC,e?" (not sent)":"");return ETIMEDOUT;}
+-    if(log) {printf("STAR BT RX: %s ms=%llu\n",name,ns/NSEC_PER_MSEC);bt_hex("RX EVENT",bw.ev,bw.ev_len);}
+-    return bw.ev_len>=7 && bw.ev[6]==0 && (rtype<0 || (bw.ev_len>=8 && bw.ev[7]==rtype))?0:EIO;
++    if(log) {printf("STAR BT RX: %s ms=%llu\n",name,ns/NSEC_PER_MSEC);bt_hex("RX EVENT",bw.reply,bw.reply_len);}
++    return bw.reply_len>=7 && bw.reply[6]==0 && (rtype<0 || (bw.reply_len>=8 && bw.reply[7]==rtype))?0:EIO;
+ }
+ static int bt_edl(uint8_t request,const char *name)
+ {
+@@ -678,7 +695,7 @@
+         ++segments;at+=seg;
+         if(e) {
+             printf("STAR BT %s: segment %u failed (%d)\n",name,segments,e);
+-            if(e==EIO) bt_hex("RX EVENT",bw.ev,bw.ev_len);
++            if(e==EIO) bt_hex("RX EVENT",bw.reply,bw.reply_len);
+             return e;
+         }
+     }
+@@ -728,8 +745,7 @@
+     int e=bt_send(cmd,sizeof(cmd),deadline);
+     if(!e) {
+         clock_interval_to_deadline(POLL_WAIT_TIMEOUT_MSEC,NSEC_PER_MSEC,&deadline);
+-        while(!bu_tx_empty() && mach_absolute_time()<deadline) bt_pump(deadline);
+-        bool sent=bu_tx_empty();
++        bool sent=bt_run(bt_tx_drained,deadline);
+         printf("STAR BT SPEED: 0xfc48 %#x %s at %u\n",qca_baudrate,sent?"sent":"not drained in 100 ms",bu.cur_baud);
+         bt_sleep_ms(1);                                          /* usleep_range(1000, 10000) */
+         bu_set_termios(speed,false);                             /* host_set_baudrate */
+@@ -759,7 +775,7 @@
+     printf("STAR BT SERVICE: UART owned, IRQ %u driven, IBS tx/rx ASLEEP, wake_retrans=100 ms tx_idle=2000 ms\n",BU_IRQ);
+     bw.service=true;
+     bt_stats("service start");bw.last_stats=mach_absolute_time();
+-    for(;;) bt_pump(0);
++    for(;;) {bt_step();bt_wait(0);}
+ }
+ static void renoir_bluetooth_hci_run(void *arg __unused,wait_result_t result __unused)
+ {
+@@ -832,7 +848,7 @@
+             if(!e) {
+                 bt_sleep_ms(10);
+                 /* WCN6855 NVM name: qca_read_fw_board_id; its failure leaves board ID 0 */
+-                if(!bt_edl(0x23,"EDL_GET_BID_REQ")) printf("STAR BT FIRMWARE: board ID %#x -> hpnv20.bin\n",bw.ev_len>=11?(bw.ev[9]<<8)|bw.ev[10]:0);
++                if(!bt_edl(0x23,"EDL_GET_BID_REQ")) printf("STAR BT FIRMWARE: board ID %#x -> hpnv20.bin\n",bw.reply_len>=11?(bw.reply[9]<<8)|bw.reply[10]:0);
+                 memcpy(nvm_copy,nvm,nsize);
+                 unsigned length=(nvm_copy[1]|(nvm_copy[2]<<8)|(nvm_copy[3]<<16)),edits=0;
+                 for(unsigned idx=0;idx+12<=length && 4+idx+12<=nsize;) {
+@@ -850,10 +866,10 @@
+             if(!e) e=bt_edl(0x20,"EDL_GET_BUILD_INFO");
+             if(!e) {
+                 /* qca_read_fw_build_info: data[0] is the label length */
+-                char label[64];unsigned n=bw.ev[8],len=bw.ev_len;
++                char label[64];unsigned n=bw.reply[8],len=bw.reply_len;
+                 if(n>sizeof(label)-1) n=sizeof(label)-1;
+                 if(9+n>len) n=len>9?len-9:0;
+-                for(unsigned i=0;i<n;++i) label[i]=(char)bw.ev[9+i];
++                for(unsigned i=0;i<n;++i) label[i]=(char)bw.reply[9+i];
+                 label[n]=0;
+                 printf("STAR BT HCI SUMMARY: rampatch/NVM/HCI_Reset at %u done; firmware %s\n",bu.cur_baud,label);
+                 bw.ibs=true;bw.tx_ibs=TX_ASLEEP;bw.rx_awake=false;      /* clear_bit(QCA_IBS_DISABLED) */

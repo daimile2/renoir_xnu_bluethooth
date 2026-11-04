@@ -1,0 +1,429 @@
+--- a/bsd/dev/star_gpu_clock.c
++++ b/bsd/dev/star_gpu_clock.c
+@@ -12,7 +12,7 @@
+ #include <sys/errno.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+-struct native_rate { uint32_t hz, source, divisor; };
++struct native_rate { uint32_t hz, source, divisor, m, n; };
+ static const struct native_rate gmu_rates[] = {
+     {19200000, 0, 1}, {200000000, 6, 2}, {500000000, 3, 1}
+ };
+@@ -22,6 +22,13 @@
+ /* gcc-shima: mnd_width=8 but all four rates use integer division (m=n=0). */
+ static const struct native_rate ufs_axi_rates[] = {
+     {25000000,6,23}, {75000000,6,7}, {150000000,6,3}, {300000000,6,1}
++};
++/* gcc-shima wrap0 S2/S7 table; 16-bit M/N. */
++static const struct native_rate se7_rates[] = {
++    {7372800,6,1,384,15625},{14745600,6,1,768,15625},{19200000,0,1,0,0},
++    {29491200,6,1,1536,15625},{32000000,6,1,8,75},{48000000,6,1,4,25},
++    {64000000,6,1,16,75},{75000000,6,7,0,0},{80000000,6,1,4,15},
++    {96000000,6,1,8,25},{100000000,1,11,0,0}
+ };
+ static const struct native_rate cxo = {19200000, 0, 1};
+ static uint32_t reg_read(volatile uint32_t *p)
+@@ -56,7 +63,8 @@
+ {
+     return (volatile uint32_t *)(rcg->gpucc +
+         (rcg->kind == STAR_GPU_RCG_GMU ? 0x1120 :
+-         rcg->kind == STAR_GPU_RCG_HUB ? 0x117c : 0x77024));
++         rcg->kind == STAR_GPU_RCG_HUB ? 0x117c :
++         rcg->kind == STAR_GPU_RCG_SE7 ? 0x17860 : 0x77024));
+ }
+ static const struct native_rate *find_rate(struct star_gpu_rcg *rcg, uint32_t hz)
+ {
+@@ -68,6 +76,8 @@
+         table = hub_rates; count = sizeof(hub_rates)/sizeof(hub_rates[0]);
+     } else if (rcg->kind == STAR_GPU_RCG_UFS_AXI) {
+         table = ufs_axi_rates; count = sizeof(ufs_axi_rates)/sizeof(ufs_axi_rates[0]);
++    } else if (rcg->kind == STAR_GPU_RCG_SE7) {
++        table=se7_rates;count=sizeof(se7_rates)/sizeof(se7_rates[0]);
+     } else return NULL;
+     for (unsigned i = 0; i < count; i++) if (hz <= table[i].hz) return &table[i];
+     return NULL;
+@@ -88,7 +98,13 @@
+ {
+     volatile uint32_t *cmd = command(rcg);
+     const uint32_t mask = 0x1f | 0x700 | 0x3000 | (1U << 20);
+-    update_bits(cmd + 1, mask, rate->divisor | (rate->source << 8));
++    if (rcg->kind==STAR_GPU_RCG_SE7 && rate->n) {
++        update_bits(cmd+2,0xffff,rate->m);
++        update_bits(cmd+3,0xffff,~(rate->n-rate->m));
++        update_bits(cmd+4,0xffff,~rate->n);
++    }
++    update_bits(cmd + 1, mask, rate->divisor | (rate->source << 8) |
++        (rate->n && rate->m!=rate->n ? 2U<<12 : 0));
+     update_bits(cmd, 1, 1);
+     for (unsigned count = 500; count > 0; count--) {
+         if (!(reg_read(cmd) & 1)) return 0;
+--- a/bsd/sys/star_gpu_clock.h
++++ b/bsd/sys/star_gpu_clock.h
+@@ -2,7 +2,7 @@
+ #ifndef _SYS_STAR_GPU_CLOCK_H_
+ #define _SYS_STAR_GPU_CLOCK_H_
+ #include <sys/types.h>
+-enum star_gpu_rcg_kind { STAR_GPU_RCG_GMU, STAR_GPU_RCG_HUB, STAR_GPU_RCG_UFS_AXI };
++enum star_gpu_rcg_kind { STAR_GPU_RCG_GMU, STAR_GPU_RCG_HUB, STAR_GPU_RCG_UFS_AXI, STAR_GPU_RCG_SE7 };
+ /* Native GPUCC RCG register operations only. Parent clocks, regulator votes,
+  * prepare/enable reference counts and provider lock remain caller-owned.
+  * current_hz must come from native recalc/current state, not a debug constant. */
+--- a/bsd/dev/star_gpu_clock_provider.c
++++ b/bsd/dev/star_gpu_clock_provider.c
+@@ -17,7 +17,7 @@
+ #include <kern/locks.h>
+ #include <machine/machine_routines.h>
+ extern vm_offset_t ml_io_map(vm_offset_t,vm_size_t);
+-enum kind { XO,PLL,DIV,BRANCH,RCG,RO_DIV,BCM };
++enum kind { XO,PLL,DIV,BRANCH,RCG,RO_DIV,BCM,DFS };
+ enum halt { HALT,DELAY,VOTED,SKIP };
+ struct clock {
+     enum kind kind;
+@@ -26,6 +26,7 @@
+     unsigned prepares,enables,hold,selected_vdd,registered,boot_on,was_orphan;
+     uint32_t cached;
+     struct star_gpu_regulator *vreg;
++    unsigned enable_reg;
+ };
+ #define C(k,p,r,g,o,m,h,hc,a,d,c) { .kind=k,.parent=p,.rail=r,.gpu=g,.reg=o,.mask=m,.halt=h,.hwcg=hc,.aon=a,.dont_hold=d,.critical=c }
+ static struct clock clocks[STAR_CLK_COUNT]={
+@@ -60,11 +61,15 @@
+     [STAR_CLK_SLEEP]=C(BRANCH,-1,-1,1,0x1090,1,VOTED,0,0,0,0),
+     [STAR_CLK_UFS_AXI_SRC]=C(RCG,STAR_CLK_XO,STAR_GPU_CX,0,0x77024,0,0,0,0,0,0),
+     [STAR_CLK_AGGRE_UFS_AXI]=C(BRANCH,STAR_CLK_UFS_AXI_SRC,-1,0,0x770cc,1,VOTED,2,0,0,0),
++    [STAR_CLK_QUP0_M_AHB]=C(BRANCH,-1,-1,0,0x17004,1U<<6,VOTED,2,0,0,0),
++    [STAR_CLK_QUP0_S_AHB]=C(BRANCH,-1,-1,0,0x17008,1U<<7,VOTED,2,0,0,0),
++    [STAR_CLK_SE7_SRC]=C(RCG,STAR_CLK_XO,-1,0,0x17860,0,0,0,0,0,0),
++    [STAR_CLK_SE7]=C(BRANCH,STAR_CLK_SE7_SRC,-1,0,0x1785c,1U<<17,VOTED,0,0,0,0),
+     [STAR_CLK_IPA]=C(BCM,-1,-1,0,0,0,0,0,0,0,0),
+ };
+ #undef C
+ static volatile uint8_t *gcc,*gpucc;
+-static struct star_gpu_rcg rcgs[3];
++static struct star_gpu_rcg rcgs[4];
+ static uint32_t xo_address,ipa_address,ipa_state,ipa_sent;
+ static uint64_t ipa_unit;
+ static unsigned xo_sent,xo_state[2],cx_users;
+@@ -142,7 +147,7 @@
+ }
+ static int branch(struct clock *c,int on)
+ {
+-    star_gpu_update32(base(c),c->reg,c->mask,on?c->mask:0);
++    star_gpu_update32(base(c),c->enable_reg?c->enable_reg:c->reg,c->mask,on?c->mask:0);
+     if(c->halt==SKIP)return 0;
+     if(c->hwcg&&(read_clock(c,0)&c->hwcg))return 0;
+     if(c->halt==DELAY||(!on&&c->halt==VOTED)) {star_gpu_native_udelay(10);return 0;}
+@@ -153,7 +158,7 @@
+     }
+     star_gpu_log("STAR GPU branch: native status stuck reg=%#x\n",c->reg);return EBUSY;
+ }
+-static unsigned rcg_index(int id) {return id==STAR_CLK_GMU_SRC?0:id==STAR_CLK_HUB_SRC?1:2;}
++static unsigned rcg_index(int id) {return id==STAR_CLK_GMU_SRC?0:id==STAR_CLK_HUB_SRC?1:id==STAR_CLK_SE7_SRC?3:2;}
+ static uint32_t rate(int id)
+ {
+     struct clock *c=&clocks[id];
+@@ -167,6 +172,22 @@
+         return rate(c->parent)/(div==1?2:1);
+     }
+     if(c->kind==RO_DIV)return rate(c->parent)/((read_clock(c,0)&15)+1);
++    if(id==STAR_CLK_SE7_SRC) {
++        unsigned level=(read_clock(c,0x14)>>1)&15;
++        unsigned cfg=read_clock(c,c->kind==DFS?0x1c+4*level:4);
++        if(c->kind!=DFS && !(cfg&0x700) && (!c->prepares || (read_clock(c,0)&(1U<<31))))
++            return c->cached?c->cached:19200000;
++        unsigned hid=cfg&31,mode=(cfg>>12)&3;
++        uint64_t hz=c->parent<0?0:rate(c->parent);
++        if(c->kind==DFS&&!hid)hid=1;
++        if(hid)hz=hz*2/(hid+1);
++        if(mode) {
++            unsigned m=read_clock(c,c->kind==DFS?0x5c+4*level:8)&65535;
++            unsigned n=(~read_clock(c,c->kind==DFS?0x9c+4*level:12)&65535)+m;
++            if(n)hz=hz*m/n;
++        }
++        return (uint32_t)hz;
++    }
+     if(c->kind==RCG) {
+         unsigned cfg=read_clock(c,4),source=(cfg>>8)&7;
+         if(!source&&(!c->prepares||(read_clock(c,0)&(1U<<31))))
+@@ -192,6 +213,7 @@
+         for(unsigned i=0;i<5;i++)if((hz+500)/1000<=(pll_hz[i]+500)/1000)return pll_levels[i];
+         return 0;
+     }
++    if(id==STAR_CLK_SE7_SRC)return hz<=75000000?1:hz<=100000000?3:0;
+     if(id==STAR_CLK_UFS_AXI_SRC)return hz<=75000000?1:hz<=150000000?3:hz<=300000000?5:0;
+     if(id==STAR_CLK_GMU_SRC)return hz<=200000000?1:hz<=500000000?3:0;
+     if(id==STAR_CLK_HUB_SRC)return hz<=150000000?1:hz<=240000000?3:hz<=300000000?5:0;
+@@ -305,14 +327,14 @@
+ static int boot_enabled(int id)
+ {
+     struct clock *c=&clocks[id];
+-    if(c->kind==BRANCH)return !!(read_clock(c,0)&c->mask);
++    if(c->kind==BRANCH)return !!(star_gpu_read32(base(c),c->enable_reg?c->enable_reg:c->reg)&c->mask);
+     if(c->kind==PLL)return pll_is_enabled(c);
+-    if(c->kind==RCG)return !(read_clock(c,0)&(1U<<31));
++    if(c->kind==RCG||c->kind==DFS)return !(read_clock(c,0)&(1U<<31));
+     return 0; /* RPMh clocks start with software state=0 in native probe. */
+ }
+ static int selected_parent(int id,unsigned source)
+ {
+-    if(id==STAR_CLK_UFS_AXI_SRC) {
++    if(id==STAR_CLK_UFS_AXI_SRC||id==STAR_CLK_SE7_SRC) {
+         switch(source){case 0:return STAR_CLK_XO;case 1:return STAR_CLK_GPLL0;
+         case 6:return STAR_CLK_GPLL0_EVEN;case 7:return -1;default:return STAR_CLK_XO;}
+     }
+@@ -329,7 +351,7 @@
+ static int orphan(int id)
+ {
+     struct clock *c=&clocks[id];
+-    if(c->kind==RCG&&c->parent<0)return 1;
++    if((c->kind==RCG||c->kind==DFS)&&c->parent<0)return 1;
+     return c->parent>=0?(!clocks[c->parent].registered||orphan(c->parent)):0;
+ }
+ static void hold_state(int id)
+@@ -388,10 +410,16 @@
+     static const int hub_parents[]={STAR_CLK_GCC_DIV,STAR_CLK_GCC_MAIN,STAR_CLK_GCC_MAIN};
+     static const uint32_t ufs_rates[]={25000000,75000000,150000000,300000000};
+     static const int ufs_parents[]={STAR_CLK_GPLL0_EVEN,STAR_CLK_GPLL0_EVEN,STAR_CLK_GPLL0_EVEN,STAR_CLK_GPLL0_EVEN};
+-    unsigned count=id==STAR_CLK_UFS_AXI_SRC?4:3;
++    static const uint32_t se7_rates[]={7372800,14745600,19200000,29491200,32000000,
++        48000000,64000000,75000000,80000000,96000000,100000000};
++    static const int se7_parents[]={STAR_CLK_GPLL0_EVEN,STAR_CLK_GPLL0_EVEN,STAR_CLK_XO,
++        STAR_CLK_GPLL0_EVEN,STAR_CLK_GPLL0_EVEN,STAR_CLK_GPLL0_EVEN,STAR_CLK_GPLL0_EVEN,
++        STAR_CLK_GPLL0_EVEN,STAR_CLK_GPLL0_EVEN,STAR_CLK_GPLL0_EVEN,STAR_CLK_GPLL0};
++    unsigned count=id==STAR_CLK_SE7_SRC?11:id==STAR_CLK_UFS_AXI_SRC?4:3;
+     unsigned index=0;const uint32_t *rates=id==STAR_CLK_GMU_SRC?gmu_rates:hub_rates;
+     const int *parents=id==STAR_CLK_GMU_SRC?gmu_parents:hub_parents;
+     if(id==STAR_CLK_UFS_AXI_SRC){rates=ufs_rates;parents=ufs_parents;}
++    if(id==STAR_CLK_SE7_SRC){rates=se7_rates;parents=se7_parents;}
+     while(index<count&&hz>rates[index])index++;
+     if(index==count)return EINVAL;
+     hz=rates[index];
+@@ -670,3 +698,26 @@
+     lck_mtx_lock(&star_gpu_cc_lock);if(opened)disable_clock(id);
+     lck_mtx_unlock(&star_gpu_cc_lock);
+ }
++
++/* Native GCC DFS registration is read-only when firmware enabled DFS.
++ * These clocks join the existing provider so parent/VDD holds are shared. */
++int star_gpu_clock_qup0_open(void)
++{
++    int e=star_gpu_clock_provider_open();if(e)return e;
++    lck_mtx_lock(&star_gpu_cc_lock);
++    if(clocks[STAR_CLK_SE7].registered)goto out;
++    struct clock *c=&clocks[STAR_CLK_SE7_SRC];
++    c->rail=STAR_GPU_CX;c->vreg=vdd[0].regulator;
++    c->parent=selected_parent(STAR_CLK_SE7_SRC,(read_clock(c,4)>>8)&7);
++    if(read_clock(c,0x14)&1)c->kind=DFS;
++    c->cached=rate(STAR_CLK_SE7_SRC);
++    rcgs[3]=(struct star_gpu_rcg){gcc,STAR_GPU_RCG_SE7,c->cached};
++    clocks[STAR_CLK_QUP0_M_AHB].enable_reg=0x52008;
++    clocks[STAR_CLK_QUP0_S_AHB].enable_reg=0x52008;
++    clocks[STAR_CLK_SE7].enable_reg=0x52008;
++    const int order[]={STAR_CLK_SE7_SRC,STAR_CLK_QUP0_M_AHB,STAR_CLK_QUP0_S_AHB,STAR_CLK_SE7};
++    for(unsigned i=0;i<4;i++){e=register_clock(order[i]);if(e)break;}
++    star_gpu_log("STAR BT CLOCK SOURCE: dfs=%u rate=%u parent=%d cfg=%08x dfsr=%08x error=%d\n",
++        c->kind==DFS,c->cached,c->parent,read_clock(c,4),read_clock(c,0x14),e);
++out:lck_mtx_unlock(&star_gpu_cc_lock);return e;
++}
+--- a/bsd/sys/star_gpu_clock_provider.h
++++ b/bsd/sys/star_gpu_clock_provider.h
+@@ -14,9 +14,11 @@
+     STAR_CLK_HUB_INT, STAR_CLK_SMMU, STAR_CLK_CRC_AHB, STAR_CLK_CX_SNOC,
+     STAR_CLK_CXO_AON, STAR_CLK_GX_GMU, STAR_CLK_MND0, STAR_CLK_MND1,
+     STAR_CLK_SLEEP, STAR_CLK_UFS_AXI_SRC, STAR_CLK_AGGRE_UFS_AXI,
+-    STAR_CLK_IPA, STAR_CLK_COUNT
++    STAR_CLK_IPA, STAR_CLK_QUP0_M_AHB, STAR_CLK_QUP0_S_AHB,
++    STAR_CLK_SE7_SRC, STAR_CLK_SE7, STAR_CLK_COUNT
+ };
+ int star_gpu_clock_provider_open(void);
++int star_gpu_clock_qup0_open(void);
+ int star_gpu_clock_resolve(enum star_gpu_clock_controller,unsigned binding,
+     enum star_gpu_clock_id *);
+ /* Bulk clients prepare every clock before enabling any, as native CCF. */
+--- a/bsd/dev/star_gpu_icc.c
++++ b/bsd/dev/star_gpu_icc.c
+@@ -13,16 +13,17 @@
+ #include <kern/locks.h>
+ #include <machine/machine_routines.h>
+ extern vm_offset_t ml_io_map(vm_offset_t,vm_size_t);
+-struct star_gpu_icc {struct star_gpu_icc *next;uint32_t average,peak;int last_error,pas;};
++struct star_gpu_icc {struct star_gpu_icc *next;uint32_t average,peak;int last_error,pas,qup;};
+ struct icc_bcm {const char *name;unsigned width,channels,keepalive,address,unit,aux_width,vcd;};
+ static struct icc_bcm bcms[]={
+     {"SH0",16,2,1,0,0,0,0},{"MC0",4,2,1,0,0,0,0},{"ACV",4,2,0,0,0,0,0},
+-    {"CE0",8,1,0,0,0,0,0},{"SN8",16,1,0,0,0,0,0},{"SN0",16,1,1,0,0,0,0}
++    {"CE0",8,1,0,0,0,0,0},{"SN8",16,1,0,0,0,0,0},{"SN0",16,1,1,0,0,0,0},
++    {"QUP0",4,1,0,0,0,0,0}
+ };
+ static struct star_gpu_icc *consumers;
+ static volatile uint8_t *gemnoc,*aggre2;
+ static unsigned bcm_count=3;
+-static int pas_qos_done;
++static int pas_qos_done,qup_qos_done;
+ static int opened,qos_done,voter_init=1,last_error;
+ LCK_GRP_DECLARE(star_gpu_icc_group,"Star ICC");
+ LCK_MTX_DECLARE(star_gpu_icc_lock,&star_gpu_icc_group);
+@@ -36,20 +37,26 @@
+ }
+ static int commit_votes(void)
+ {
+-    uint64_t avg=0,peak=0,pas_avg=0,pas_peak=0;
+-    for(struct star_gpu_icc *c=consumers;c;c=c->next){avg+=c->average;if(c->peak>peak)peak=c->peak;
+-        if(c->pas){pas_avg+=c->average;if(c->peak>pas_peak)pas_peak=c->peak;}}
+-    unsigned order[6]={0,1,2,3,4,5};
++    uint64_t avg=0,peak=0,pas_avg=0,pas_peak=0,snoc_avg=0,snoc_peak=0,qup_avg=0,qup_peak=0;
++    for(struct star_gpu_icc *c=consumers;c;c=c->next) {
++        if(c->qup){qup_avg+=c->average;if(c->peak>qup_peak)qup_peak=c->peak;continue;}
++        avg+=c->average;if(c->peak>peak)peak=c->peak;
++        if(c->pas){snoc_avg+=c->average;if(c->peak>snoc_peak)snoc_peak=c->peak;}
++        if(c->pas==1){pas_avg+=c->average;if(c->peak>pas_peak)pas_peak=c->peak;}
++    }
++    unsigned order[7]={0,1,2,3,4,5,6};
+     /* Stable sort by VCD exactly as the native voter, not a fixed SH0 order. */
+     for(unsigned i=1;i<bcm_count;i++)for(unsigned j=i;j&&bcms[order[j-1]].vcd>bcms[order[j]].vcd;j--) {
+         unsigned tmp=order[j];order[j]=order[j-1];order[j-1]=tmp;
+     }
+-    struct star_gpu_rpmh_cmd active[6],wake[6],sleep[6];unsigned differs=0;
++    struct star_gpu_rpmh_cmd active[7],wake[7],sleep[7];unsigned differs=0;
+     for(unsigned i=0;i<bcm_count;i++) {
+         struct icc_bcm *b=&bcms[order[i]];
+-        uint64_t node_avg=order[i]<3?avg:pas_avg,node_peak=order[i]<3?peak:pas_peak;
+-        uint64_t x=divide(divide(node_avg*b->aux_width,b->width*b->channels)*1000,b->unit);
+-        uint64_t y=divide(divide(node_peak*b->aux_width,b->width)*1000,b->unit),ax=x,ay=y;
++        uint64_t node_avg=order[i]<3?avg:order[i]==3?pas_avg:order[i]==6?qup_avg:snoc_avg;
++        uint64_t node_peak=order[i]<3?peak:order[i]==3?pas_peak:order[i]==6?qup_peak:snoc_peak;
++        unsigned scale=order[i]==6?1:1000; /* Native QUP0 vote_scale=1. */
++        uint64_t x=divide(divide(node_avg*b->aux_width,b->width*b->channels)*scale,b->unit);
++        uint64_t y=divide(divide(node_peak*b->aux_width,b->width)*scale,b->unit),ax=x,ay=y;
+         if(b->keepalive) {
+             if(voter_init)ax=ay=16000;
+             else if(!ax&&!ay)ax=ay=1;
+@@ -127,7 +134,27 @@
+     if(e){star_gpu_icc_put(c);return e;}
+     *out=c;return 0;
+ }
+-static int pas_qos(void)
++int star_gpu_icc_get_qup0(struct star_gpu_icc **core,struct star_gpu_icc **ddr)
++{
++    struct star_gpu_icc *d=NULL,*c=NULL;
++    int e=star_gpu_icc_get_pas(&d);if(e)return e;
++    e=star_gpu_icc_get(&c);if(e){star_gpu_icc_put(d);return e;}
++    lck_mtx_lock(&star_gpu_icc_lock);
++    if(bcm_count<7) {
++        struct star_gpu_db_entry entry;e=star_gpu_cmd_db_find("QUP0",&entry);
++        if(!e&&entry.bytes<8)e=EINVAL;
++        if(!e) {
++            bcms[6].address=entry.address;bcms[6].unit=u16(entry.aux)|((uint32_t)u16(entry.aux+2)<<16);
++            bcms[6].aux_width=u16(entry.aux+4);bcms[6].vcd=entry.aux[6];
++            if(!bcms[6].unit)e=EINVAL;else bcm_count=7;
++        }
++    }
++    d->pas=2;c->qup=1;
++    lck_mtx_unlock(&star_gpu_icc_lock);
++    if(e){star_gpu_icc_put(c);star_gpu_icc_put(d);return e;}
++    *core=c;*ddr=d;return 0;
++}
++static int pas_qos(int qup)
+ {
+     /* DT aggre2 clock order; native clk_bulk_prepare_enable prepares all
+      * before enabling any. GEM-NoC has no QoS clocks. */
+@@ -135,11 +162,11 @@
+     unsigned prepared=0,enabled=0;int e=0;
+     for(;prepared<2;prepared++){e=star_gpu_clock_prepare(ids[prepared]);if(e)goto done;}
+     for(;enabled<2;enabled++){e=star_gpu_clock_enable(ids[enabled]);if(e)goto done;}
+-    star_gpu_update32(aggre2,0x1d008,0x70,2U<<4);
+-    star_gpu_update32(aggre2,0x1d008,8,8);
++    star_gpu_update32(aggre2,qup?0x19008:0x1d008,0x70,2U<<4);
++    star_gpu_update32(aggre2,qup?0x19008:0x1d008,8,qup?0:8);
+     star_gpu_update32(gemnoc,0xa4008,0x70,0);
+     star_gpu_update32(gemnoc,0xa4008,8,8);
+-    pas_qos_done=1;
++    if(qup)qup_qos_done=1;else pas_qos_done=1;
+ done:
+     while(enabled)star_gpu_clock_disable(ids[--enabled]);
+     while(prepared)star_gpu_clock_unprepare(ids[--prepared]);
+@@ -153,8 +180,9 @@
+     /* qcom_icc_set ignores voter return; only QoS clock errors propagate.
+      * Actual GEM-NoC DT has zero clocks. QoS uses native regmap_update_bits. */
+     int e=0;
+-    if(c->pas&&!pas_qos_done&&(average||peak))e=pas_qos();
+-    if(!c->pas&&!qos_done&&(average||peak)) {
++    if(c->pas==1&&!pas_qos_done&&(average||peak))e=pas_qos(0);
++    if(c->pas==2&&!qup_qos_done&&(average||peak))e=pas_qos(1);
++    if(!c->pas&&!c->qup&&!qos_done&&(average||peak)) {
+         unsigned offsets[2]={0x22008,0x62008};
+         for(unsigned i=0;i<2;i++) {
+             star_gpu_update32(gemnoc,offsets[i],0x70,0);
+--- a/bsd/sys/star_gpu_icc.h
++++ b/bsd/sys/star_gpu_icc.h
+@@ -6,6 +6,8 @@
+ int star_gpu_icc_get(struct star_gpu_icc **);
+ /* Live pil_scm_pas: MASTER_CRYPTO_CORE0 -> SLAVE_EBI1. */
+ int star_gpu_icc_get_pas(struct star_gpu_icc **);
++/* Live GENI wrapper0: QUP_CORE_0->QUP_CORE_0 and QUP_0->EBI1. */
++int star_gpu_icc_get_qup0(struct star_gpu_icc **core,struct star_gpu_icc **ddr);
+ /* Actual MASTER_GFX3D -> LLCC -> EBI path, KB/s. */
+ int star_gpu_icc_set(struct star_gpu_icc *,uint32_t average,uint32_t peak);
+ void star_gpu_icc_put(struct star_gpu_icc *);
+--- a/bsd/dev/renoir_bluetooth_probe.inc
++++ b/bsd/dev/renoir_bluetooth_probe.inc
+@@ -1,7 +1,51 @@
++/* MiCode msm_geni_serial_get_ver_info resource phase, HSUART branch.
++ * DMA/IRQ/HCI are not registered yet: leave engine interrupt masks and
++ * command/FIFO registers untouched. Protocol=UART is required before DMA.
++ * The wrapper's two live-DT paths vote 50000/100000 and 0/76800, respectively.
++ */
++#include <sys/star_gpu_clock_provider.h>
++#include <sys/star_gpu_icc.h>
++#include <sys/errno.h>
++extern void ml_io_unmap(vm_offset_t,vm_size_t);
++static void bt_unmap(vm_offset_t address,vm_size_t size)
++{
++    if(address)ml_io_unmap(trunc_page(address),round_page(size+(address-trunc_page(address))));
++}
++static void renoir_bluetooth_uart_probe(void)
++{
++    int enabled=1;
++    PE_parse_boot_argn("renoirbt",&enabled,sizeof(enabled));
++    if(!enabled)return;
++    struct star_gpu_icc *core=NULL,*ddr=NULL;
++    vm_offset_t uart=0,wrapper=0;unsigned clocks=0;int e,cleanup=0;
++    const enum star_gpu_clock_id order[]={STAR_CLK_QUP0_M_AHB,STAR_CLK_QUP0_S_AHB,STAR_CLK_SE7};
++    e=star_gpu_clock_qup0_open();if(e)goto done;
++    e=star_gpu_icc_get_qup0(&core,&ddr);if(e)goto done;
++    uart=ml_io_map(0x99c000,0x4000);wrapper=ml_io_map(0x9c0000,0x2000);
++    if(!uart||!wrapper){e=ENOMEM;goto done;}
++    e=star_gpu_icc_set(core,50000,100000);if(e)goto done;
++    e=star_gpu_icc_set(ddr,0,76800);if(e)goto done;
++    printf("STAR BT BUS: core=50000/100000 ddr=0/76800 voter=%d/%d\n",
++        star_gpu_icc_consumer_error(core),star_gpu_icc_consumer_error(ddr));
++    for(;clocks<3;clocks++){e=star_gpu_clock_prepare_enable(order[clocks]);if(e)goto done;}
++    uint32_t fw=rd(uart,0x68),sfw=rd(uart,0x6c),hw=rd(wrapper,4);
++    unsigned protocol=(fw>>8)&255;
++    printf("STAR BT GENI: protocol=%u expected=2 m_fw=%u s_fw=%u hw=%08x tx_param=%08x rx_param=%08x status=%08x dma=%08x rate=%u\n",
++        protocol,fw&255,sfw&255,hw,rd(uart,0xe24),rd(uart,0xe28),rd(uart,0x40),rd(uart,0x258),
++        star_gpu_clock_get_rate(STAR_CLK_SE7));
++    if(protocol!=2)e=ENXIO;
++done:
++    while(clocks)star_gpu_clock_disable_unprepare(order[--clocks]);
++    if(core){cleanup=star_gpu_icc_set(core,0,0);star_gpu_icc_put(core);}
++    if(ddr){int result=star_gpu_icc_set(ddr,0,0);if(result)cleanup=result;star_gpu_icc_put(ddr);}
++    bt_unmap(uart,0x4000);bt_unmap(wrapper,0x2000);
++    printf("STAR BT UART PROBE: error=%d cleanup=%d hci=0 dma_started=0; native version boundary\n",e,cleanup);
++}
++
+ /* QCA6490 Bluetooth preflight from renoir-live.dts: hsuart0 SE7,
+  * GPIO65 BT_EN, GPIO91 SW_CTRL, UART CTS/RTS/TX/RX68..71.
+- * Read-only TLMM/GCC inventory. No GPIO/clock votes, UART FIFO reads,
+- * reset/HCI/firmware writes or claims that an iOS transport is registered. */
++ * Read-only TLMM/GCC inventory precedes the resource-backed GENI probe.
++ * No GPIO reset, UART FIFO, HCI or firmware writes; no iOS transport yet. */
+ static void
+ renoir_bluetooth_preflight(vm_offset_t gcc)
+ {
+@@ -19,4 +63,5 @@
+     printf("STAR BT AHB: master=%#x slave=%#x\n",rd(gcc,0x17004),rd(gcc,0x17008));
+     printf("STAR BT CLOCK: SE7 branch=%#x source=%#x votes=%#x halted=%u\n",branch,source,votes,branch>>31);
+     printf("STAR BT SUMMARY: gpio_maps=%u enabled=%u se_clock=%u uart_untouched=1 hci=0; shared rails require managed ownership before power-up\n",mapped,enabled,!(branch>>31));
++    renoir_bluetooth_uart_probe();
+ }

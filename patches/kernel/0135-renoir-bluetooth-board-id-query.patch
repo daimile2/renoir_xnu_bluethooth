@@ -1,0 +1,89 @@
+--- a/bsd/dev/renoir_bluetooth_hci.inc
++++ b/bsd/dev/renoir_bluetooth_hci.inc
+@@ -15,8 +15,13 @@
+  *    RFR_OPEN); setup_tx + geni_se_tx_dma_prep.
+  *  - DMA buffers through the wrapper's apps-SMMU stream 0x4c3 (DT iommus,
+  *    qcom,iommu-dma-addr-pool 0x40000000), mapped like the Wi-Fi SID2401 bank.
+- *  - The query is btqca qca_read_soc_version's EDL_PATCH_VER_REQ (H4 01,
+- *    opcode 0xfc00, 1 byte 0x19), waited for HCI_INIT_TIMEOUT (10 s).
++ *  - Queries, each waited for HCI_INIT_TIMEOUT (10 s), RX DMA re-armed per
++ *    packet (handle_dma_rx): btqca qca_read_soc_version's EDL_PATCH_VER_REQ
++ *    (H4 01, opcode 0xfc00, 1 byte 0x19), then qca_read_fw_board_id's
++ *    EDL_GET_BID_REQ (0x23), which picks the hpnv20.<bid> NVM. Device
++ *    20261103-161143 answered the first as a command complete (WCN3991-style
++ *    layout): product 0x13, patch 0x17f3, ROM 0x0200, SoC 0x400c0200, i.e.
++ *    hpbtfw20.tlv / hpnv20.*.
+  * Not native: completion is polled (no SE/GPIO wake IRQ is registered yet);
+  * no patch/NVM download; no iOS transport. Afterwards the RX sequencer is
+  * stopped (stop_rx_sequencer), BT_EN goes low (100 ms, btpower off), the SID
+@@ -155,6 +160,29 @@
+         line[k++]=hx[b>>4];line[k++]=hx[b&15];line[k++]=' ';
+     }
+     line[k]=0;printf("STAR BT %s: %u bytes: %s\n",what,n,line);
++}
++/* One EDL command on the H4 link; the event (up to 2048 bytes) is logged raw. */
++static int bt_edl(vm_offset_t uart,uint8_t request,const char *name)
++{
++    bt_wr(uart,0xd4c,7);bt_wr(uart,0xd30,(uint32_t)(BT_IOVA+0x1000));bt_wr(uart,0xd34,(uint32_t)((BT_IOVA+0x1000)>>32));
++    bt_wr(uart,0xd38,0);bt_wr(uart,0xd3c,2048);
++    const uint8_t cmd[]={0x01,0x00,0xfc,0x01,request};
++    for(unsigned i=0;i<sizeof(cmd);++i) *(volatile uint8_t *)(bts.nc+i)=cmd[i];
++    __asm__ volatile("dsb sy" ::: "memory");
++    bt_wr(uart,0x270,sizeof(cmd));bt_wr(uart,0x600,1u<<27);
++    bt_wr(uart,0xc4c,7);bt_wr(uart,0xc30,(uint32_t)BT_IOVA);bt_wr(uart,0xc34,(uint32_t)(BT_IOVA>>32));
++    bt_wr(uart,0xc38,1);bt_wr(uart,0xc3c,sizeof(cmd));
++    unsigned ms;
++    for(ms=0;ms<10000 && !(rd(uart,0xc40)&1);++ms) bt_sleep_ms(1);
++    uint32_t txs=rd(uart,0xc40);bt_wr(uart,0xc44,txs);bt_wr(uart,0x618,rd(uart,0x610));
++    printf("STAR BT TX: %s done=%u ms=%u tx_irq=%#x geni=%#x\n",name,txs&1,ms,txs,rd(uart,0x40));
++    if(!(txs&1)) return ETIMEDOUT;
++    for(ms=0;ms<10000 && !(rd(uart,0xd40)&3);++ms) bt_sleep_ms(1);  /* DMA_DONE | EOT */
++    uint32_t rxs=rd(uart,0xd40),len=rd(uart,0xd54);bt_wr(uart,0xd44,rxs);
++    printf("STAR BT RX: %s irq=%#x len=%u ms=%u s_irq=%#x\n",name,rxs,len,ms,rd(uart,0x640));
++    if(!(rxs&3)) return ETIMEDOUT;
++    bt_hex("RX EVENT",bts.nc+0x1000,len>2048?2048:len);
++    return 0;
+ }
+ static void renoir_bluetooth_hci_run(void *arg __unused,wait_result_t result __unused)
+ {
+@@ -201,28 +229,13 @@
+     bt_wr(uart,0x25c,rd(uart,0x25c)&~3u);bt_wr(uart,0x2a4,rd(uart,0x2a4)&~1u);
+     bt_wr(uart,0x280,rd(uart,0x280)&~(1u<<3));bt_wr(uart,0x2a8,rd(uart,0x2a8)&~1u);
+     bt_wr(uart,0x268,8);bt_wr(uart,0x28c,8);bt_wr(uart,0x26c,0);bt_wr(uart,0x2ac,0);
+-    /* start_rx_sequencer: RX DMA 2048 bytes at IOVA+0x1000, START_READ | RFR_OPEN */
++    /* start_rx_sequencer: START_READ | RFR_OPEN; each bt_edl arms its RX DMA */
+     bt_wr(uart,0xd4c,7);bt_wr(uart,0xd30,(uint32_t)(BT_IOVA+0x1000));bt_wr(uart,0xd34,(uint32_t)((BT_IOVA+0x1000)>>32));
+     bt_wr(uart,0xd38,0);bt_wr(uart,0xd3c,2048);
+     bt_wr(uart,0x630,(1u<<27)|(1u<<7));rx_started=true;                 /* geni_setup_s_cmd */
+     printf("STAR BT UART: 115200 8N1 CRTSCTS SE_DMA depth=%u status=%#x clk=%u\n",depth,rd(uart,0x40),star_gpu_clock_get_rate(STAR_CLK_SE7));
+-    /* EDL_PATCH_VER_REQ: H4 01, opcode fc00, length 1, 0x19 */
+-    static const uint8_t cmd[]={0x01,0x00,0xfc,0x01,0x19};
+-    for(unsigned i=0;i<sizeof(cmd);++i) *(volatile uint8_t *)(bts.nc+i)=cmd[i];
+-    __asm__ volatile("dsb sy" ::: "memory");
+-    bt_wr(uart,0x270,sizeof(cmd));bt_wr(uart,0x600,1u<<27);
+-    bt_wr(uart,0xc4c,7);bt_wr(uart,0xc30,(uint32_t)BT_IOVA);bt_wr(uart,0xc34,(uint32_t)(BT_IOVA>>32));
+-    bt_wr(uart,0xc38,1);bt_wr(uart,0xc3c,sizeof(cmd));
+-    unsigned ms;
+-    for(ms=0;ms<10000 && !(rd(uart,0xc40)&1);++ms) bt_sleep_ms(1);
+-    uint32_t txs=rd(uart,0xc40);bt_wr(uart,0xc44,txs);bt_wr(uart,0x618,rd(uart,0x610));
+-    printf("STAR BT TX: EDL_PATCH_VER_REQ done=%u ms=%u tx_irq=%#x geni=%#x\n",txs&1,ms,txs,rd(uart,0x40));
+-    if(!(txs&1)) {e=ETIMEDOUT;goto done;}
+-    for(ms=0;ms<10000 && !(rd(uart,0xd40)&3);++ms) bt_sleep_ms(1);  /* DMA_DONE | EOT */
+-    uint32_t rxs=rd(uart,0xd40),len=rd(uart,0xd54);bt_wr(uart,0xd44,rxs);
+-    printf("STAR BT RX: irq=%#x len=%u ms=%u s_irq=%#x\n",rxs,len,ms,rd(uart,0x640));
+-    if(rxs&3) bt_hex("RX EVENT",bts.nc+0x1000,len>2048?2048:len);
+-    else e=ETIMEDOUT;
++    e=bt_edl(uart,0x19,"EDL_PATCH_VER_REQ");
++    if(!e) e=bt_edl(uart,0x23,"EDL_GET_BID_REQ");
+ done:
+     if(uart && rx_started) {
+         /* stop_rx_sequencer: manual flow off, cancel S command, RX DMA FSM reset */
+@@ -241,7 +254,7 @@
+     if(core){cleanup=star_gpu_icc_set(core,0,0);star_gpu_icc_put(core);}
+     if(ddr){int r=star_gpu_icc_set(ddr,0,0);if(r)cleanup=r;star_gpu_icc_put(ddr);}
+     if(uart) bt_unmap(uart,0x4000);
+-    printf("STAR BT HCI SUMMARY: error=%d cleanup=%d powered_then_off=%u smmu=%u; identity query only, no patch/NVM, no iOS transport\n",e,cleanup,powered,smmu);
++    printf("STAR BT HCI SUMMARY: error=%d cleanup=%d powered_then_off=%u smmu=%u; version/board-id queries only, no patch/NVM, no iOS transport\n",e,cleanup,powered,smmu);
+     thread_terminate_self();
+ }
+ static void renoir_bluetooth_hci_start(void)

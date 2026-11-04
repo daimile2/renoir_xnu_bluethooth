@@ -1,0 +1,30 @@
+{
+  "target": "renoir / SM7350 / QCA6490",
+  "runtime_build": "20H392",
+  "kernel": "XNU 8796.141.3 / Renoir kernel143",
+  "device_tree_node": "/arm-io/bluetooth",
+  "properties": {
+    "device_type": {"type": "cstring", "value": "bluetooth"},
+    "compatible": {"type": "cstring", "value": "qcom,qca6490-bt"},
+    "transport-encoding": {"type": "u32", "value": 1},
+    "transport-speed": {"type": "u32", "value": 3200000},
+    "local-mac-address": {"type": "bytes[6]", "source": "owner-supplied private device address; no shared default"}
+  },
+  "firmware_resources": [
+    {"source": "hpbtfw20.tlv", "resource_name": "bt-hpbtfw20.tlv", "redistributed": false},
+    {"source": "hpnv20.bin", "resource_name": "bt-hpnv20.bin", "redistributed": false}
+  ],
+  "parent_environment": ["RENOIR_BT_FW_DIR", "RENOIR_BT_ADDRESS_FILE"],
+  "startup_dependency": "Renoir Wi-Fi owner retains the shared power rail votes",
+  "boot_argument": {"renoirbt": "default 1; 0 disables the Bluetooth worker"},
+  "hardware": {
+    "uart": "0x0099c000",
+    "wrapper": "0x009c0000",
+    "gpio": {"cts": 68, "rts": 69, "tx": 70, "rx": 71, "bt_en": 65, "sw_ctrl": 91},
+    "se_irq_intid": 640,
+    "irq_trigger": "level-high",
+    "smmu_sid": "0x4c3",
+    "iova": "0x40000000",
+    "dma_window_bytes": 16384
+  }
+}

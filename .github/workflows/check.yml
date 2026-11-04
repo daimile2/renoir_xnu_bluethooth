@@ -1,0 +1,22 @@
+name: Public source checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Public inventory and syntax
+        run: python3 tools/check-release.py
+      - name: Per-file license metadata
+        run: |
+          python3 -m venv "$RUNNER_TEMP/bt-license"
+          "$RUNNER_TEMP/bt-license/bin/pip" -q install reuse==6.3.0
+          "$RUNNER_TEMP/bt-license/bin/reuse" lint
+      - name: Ordered kernel patch application
+        run: python3 tools/check-patches.py
+      - name: Production H4 and IBS parser
+        run: python3 tests/test_bluetooth_h4_parser.py
+      - name: Production worker state and reply ownership
+        run: python3 tests/test_bluetooth_worker_sim.py

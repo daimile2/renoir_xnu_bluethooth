@@ -1,0 +1,1034 @@
+--- a/bsd/dev/renoir_bluetooth_transport.inc
++++ b/bsd/dev/renoir_bluetooth_transport.inc
+@@ -16,7 +16,9 @@
+  * IOSkywalkFamily, which this kernel does not have; one pipe instance is
+  * bound to the pid that set the spec. Bytes are exchanged with the UART
+  * owner (renoir_bluetooth_hci.inc) through two FIFOs; as on a closed
+- * serial port, received bytes are discarded while no RX ring exists.
++ * serial port, received bytes are discarded while no RX ring exists. With a
++ * ring, the owner only writes what fits (the UART then holds RFR). Queued
++ * TX and freed RX space signal the owner's worker semaphore (bt_work).
+  * kern.renoir_bt_boot blocks until the kernel finished the QCA bring-up
+  * (BlueTool's "boot" script role) and returns 0 or its error;
+  * kern.renoir_bt_firmware is the controller's EDL build label. */
+@@ -27,8 +29,20 @@
+ #include <sys/proc.h>
+ #include <uuid/uuid.h>
+ #include <skywalk/os_skywalk.h>
++#include <mach/mach_interface.h>
++#include <mach/semaphore.h>
++#include <mach/sync_policy.h>
++#include <kern/sync_sema.h>
++#include <kern/task.h>
+ #define BT_SK_FIFO 8192u
+ #define BT_SK_LINE_SPEED 115200u
++static semaphore_t bt_work=SEMAPHORE_NULL;
++static uint64_t bt_sk_kicks_tx,bt_sk_kicks_rx;
++static void bt_kick(void)
++{
++    semaphore_t s=bt_work;
++    if(s!=SEMAPHORE_NULL) (void)semaphore_signal(s);
++}
+ struct bt_termios64 {
+     uint64_t iflag,oflag,cflag,lflag;
+     uint8_t cc[20];
+@@ -82,23 +96,20 @@
+     lck_mtx_unlock(&bt_sk_lock);
+ }
+ 
+-/* UART owner side. */
+-static uint32_t renoir_bt_sk_rx_space(void)
+-{
+-    lck_mtx_lock(&bt_sk_lock);
+-    uint32_t space=bt_sk.rxring&&!bt_sk.closing?BT_SK_FIFO-bt_sk.rx_len:BT_SK_FIFO;
+-    lck_mtx_unlock(&bt_sk_lock);
+-    return space;
+-}
+-static void renoir_bt_sk_rx_put(const uint8_t *data,uint32_t n)
+-{
+-    if(!n) return;
+-    lck_mtx_lock(&bt_sk_lock);
+-    if(!bt_sk.rxring || bt_sk.closing || n>BT_SK_FIFO-bt_sk.rx_len) {
+-        bt_sk.rx_dropped+=n;lck_mtx_unlock(&bt_sk_lock);return;
+-    }
++/* UART owner side. rx_put returns the bytes taken: all of them while no
++ * RX ring exists (discarded), else what fits in the FIFO. */
++static uint32_t renoir_bt_sk_rx_put(const uint8_t *data,uint32_t n)
++{
++    if(!n) return 0;
++    lck_mtx_lock(&bt_sk_lock);
++    if(!bt_sk.rxring || bt_sk.closing) {
++        bt_sk.rx_dropped+=n;lck_mtx_unlock(&bt_sk_lock);return n;
++    }
++    if(n>BT_SK_FIFO-bt_sk.rx_len) n=BT_SK_FIFO-bt_sk.rx_len;
++    if(!n) {lck_mtx_unlock(&bt_sk_lock);return 0;}
+     bt_sk_fifo_put(bt_sk.rx,bt_sk.rx_head,&bt_sk.rx_len,data,n);
+     bt_sk_notify(bt_sk.rxring);
++    return n;
+ }
+ static uint32_t renoir_bt_sk_tx_pending(void)
+ {
+@@ -131,6 +142,7 @@
+     bt_sk.closing=true;
+     while(bt_sk.busy) (void)msleep(&bt_sk.busy,&bt_sk_lock,PZERO,"btsk",NULL);
+     lck_mtx_unlock(&bt_sk_lock);
++    bt_kick();
+ }
+ static void bt_sk_disconnected(kern_nexus_provider_t prov __unused,kern_nexus_t nexus __unused,kern_channel_t channel __unused) {}
+ static errno_t bt_sk_ring_init(kern_nexus_provider_t prov __unused,kern_nexus_t nexus __unused,kern_channel_t channel __unused,
+@@ -147,6 +159,7 @@
+     if(bt_sk.txring==ring) bt_sk.txring=NULL;
+     if(bt_sk.rxring==ring) bt_sk.rxring=NULL;
+     lck_mtx_unlock(&bt_sk_lock);
++    bt_kick();
+ }
+ /* Host -> controller: whole slots into the TX FIFO; a slot that does not fit
+  * stays in the ring until the UART owner drains the FIFO and notifies. */
+@@ -166,8 +179,9 @@
+         prev=slot;
+     }
+     if(prev) {kern_channel_advance_slot(ring,prev);(void)kern_channel_reclaim(ring);}
+-    lck_mtx_unlock(&bt_sk_lock);
+-    if(prev) wakeup(&bt_sk);
++    if(prev) ++bt_sk_kicks_tx;
++    lck_mtx_unlock(&bt_sk_lock);
++    if(prev) bt_kick();
+     return 0;
+ }
+ /* Controller -> host: the RX FIFO into freshly allocated slot packets. */
+@@ -190,9 +204,9 @@
+         VERIFY(!kern_channel_slot_attach_packet(ring,slot,ph));
+         prev=slot;
+     }
+-    if(prev) kern_channel_advance_slot(ring,prev);
+-    lck_mtx_unlock(&bt_sk_lock);
+-    if(prev) wakeup(&bt_sk);
++    if(prev) {kern_channel_advance_slot(ring,prev);++bt_sk_kicks_rx;}
++    lck_mtx_unlock(&bt_sk_lock);
++    if(prev) bt_kick();
+     return 0;
+ }
+ 
+--- a/bsd/dev/renoir_bluetooth_hci.inc
++++ b/bsd/dev/renoir_bluetooth_hci.inc
+@@ -1,4 +1,4 @@
+-/* QCA6490 Bluetooth: power-up, HS-UART in SE DMA mode and one identity query.
++/* QCA6490 Bluetooth: power-up, HS-UART in SE DMA mode, firmware and the HCI byte stream.
+  * MiCode a9244def, in its own order:
+  *  - btpower.c bt_configure_gpios(on): BT_EN (GPIO65) out-low, 50 ms; WLAN_EN
+  *    high -> BT_EN high (else 100 ms more, then high); 50 ms; read SW_CTRL (91).
+@@ -15,36 +15,29 @@
+  *    RFR_OPEN); setup_tx + geni_se_tx_dma_prep.
+  *  - DMA buffers through the wrapper's apps-SMMU stream 0x4c3 (DT iommus,
+  *    qcom,iommu-dma-addr-pool 0x40000000), mapped like the Wi-Fi SID2401 bank.
+- *  - Queries, each waited for HCI_INIT_TIMEOUT (10 s), RX DMA re-armed per
+- *    packet (handle_dma_rx): btqca qca_read_soc_version's EDL_PATCH_VER_REQ
+- *    (H4 01, opcode 0xfc00, 1 byte 0x19), then qca_read_fw_board_id's
+- *    EDL_GET_BID_REQ (0x23), which picks the hpnv20.<bid> NVM. Device
+- *    20261103-161143 answered the first as a command complete (WCN3991-style
+- *    layout): product 0x13, patch 0x17f3, ROM 0x0200, SoC 0x400c0200, i.e.
+- *    hpbtfw20.tlv / hpnv20.*. Device 20261103-162429: board ID 0 -> hpnv20.bin.
+- *  - Then qca_uart_setup at the init speed (no operating speed is set, so
+- *    the NVM baud is QCA_BAUDRATE_115200): rampatch TLV in 243-byte
++ *  - The SE interrupt (INTID 640) runs msm_geni_serial_handle_isr in a
++ *    thread (star_gpu_irq threaded adapter); one worker owns the H4 stream.
++ *  - At 115200: qca_read_soc_version's EDL_PATCH_VER_REQ (H4 01, opcode
++ *    0xfc00, 1 byte 0x19; device 20261103-161143: product 0x13, patch
++ *    0x17f3, ROM 0x0200, SoC 0x400c0200, i.e. hpbtfw20.tlv / hpnv20.*), then
++ *    qca_read_fw_board_id's EDL_GET_BID_REQ (0x23; board ID 0 -> hpnv20.bin);
++ *    qca_uart_setup at the init speed: rampatch TLV in 243-byte
+  *    EDL_PATCH_TLV_REQ segments (download_mode 3 = SKIP_EVT_VSE_CC: only the
+  *    last segment is acked), 10 ms, NVM with qca_tlv_check_data's edits
+- *    (HCI tag: in-band sleep bit, baud; deep-sleep bit), every NVM segment
+- *    acked; qca_disable_soc_logging; HCI_Reset; qca_read_fw_build_info.
++ *    (HCI tag: in-band sleep bit, baud 115200; deep-sleep bit), every NVM
++ *    segment acked;
++ *    qca_disable_soc_logging; HCI_Reset; qca_read_fw_build_info.
+  *    The files come from this phone's bluetooth_a partition via the boot
+  *    bundle (bt-hpbtfw20.tlv, bt-hpnv20.bin).
+  * After a complete setup hci_qca clears QCA_IBS_DISABLED with both IBS
+- * states ASLEEP and the UART stays owned (bt_service): H4 frames are
+- * reassembled as qca_recv_pkts (ACL/SCO/event/ISO + the three IBS bytes),
+- * ACL debug logs (QCA_DEBUG_HANDLE) go to diag, not the host; host bytes
+- * follow qca_enqueue (ASLEEP -> WAKE_IND, WAKING until WAKE_ACK with the
+- * 100 ms wake_retrans; AWAKE re-arms the 2000 ms tx_idle_delay, whose
+- * expiry sends SLEEP_IND); a device WAKE_IND is acknowledged, SLEEP_IND
+- * marks RX asleep. The iOS side is renoir_bluetooth_transport.inc.
+- * Not native: completion is polled (no SE/GPIO wake IRQ is registered yet),
+- * so the service polls every 1 ms; the serial clock votes of the IBS states
+- * are not applied (clocks stay on); no memdump/SSR handling. RX DMA is only
+- * re-armed with 2048 bytes of FIFO space (RFR flow control holds the
+- * controller meanwhile). On a failed setup the RX sequencer is stopped
+- * (stop_rx_sequencer), BT_EN goes low (100 ms, btpower off), the SID is
++ * states ASLEEP, the address is set and the UART stays owned (bt_service).
++ * The iOS side is renoir_bluetooth_transport.inc.
++ * Not native: the serial clock votes of the IBS states are not applied
++ * (clocks stay on) and the GPIO71 wake interrupt is not used; no
++ * memdump/SSR handling. On a failed setup the RX sequencer is stopped, the
++ * SE interrupt released, BT_EN goes low (100 ms, btpower off), the SID is
+  * detached and the UART clocks/bus votes are released. */
++#include <sys/star_gpu_irq.h>
+ #define BT_IOVA 0x40000000ULL
+ #define BT_DMA_BYTES 0x4000u
+ static struct {
+@@ -171,107 +164,526 @@
+     bt_wr(g,4,value?2:0);
+     bt_wr(g,0,(rd(g,0)&~0x3cu)|(1u<<9));    /* function gpio, output enable */
+ }
+-static void bt_hex(const char *what,vm_offset_t data,unsigned n)
++static void bt_hex(const char *what,const uint8_t *data,unsigned n)
+ {
+     char line[3*64+1];unsigned k=0;
+     for(unsigned i=0;i<n && i<64;++i) {
+-        static const char hx[]="0123456789abcdef";uint8_t b=*(volatile uint8_t *)(data+i);
++        static const char hx[]="0123456789abcdef";uint8_t b=data[i];
+         line[k++]=hx[b>>4];line[k++]=hx[b&15];line[k++]=' ';
+     }
+     line[k]=0;printf("STAR BT %s: %u bytes: %s\n",what,n,line);
+ }
+-/* handle_dma_rx re-arms the 2048-byte RX DMA for every packet. */
+-static void bt_rx_arm(vm_offset_t uart)
+-{
+-    bt_wr(uart,0xd4c,7);bt_wr(uart,0xd30,(uint32_t)(BT_IOVA+0x1000));bt_wr(uart,0xd34,(uint32_t)((BT_IOVA+0x1000)>>32));
+-    bt_wr(uart,0xd38,0);bt_wr(uart,0xd3c,2048);
+-}
+-/* One H4 packet through setup_tx + geni_se_tx_dma_prep; done = TX_DMA_DONE. */
+-static int bt_tx(vm_offset_t uart,const uint8_t *packet,unsigned bytes)
+-{
+-    for(unsigned i=0;i<bytes;++i) *(volatile uint8_t *)(bts.nc+i)=packet[i];
++
++/* UART layer: msm_geni_serial in SE_DMA mode. The threaded handler of the
++ * SE interrupt (DT GIC_SPI 0x260 level-high, INTID 640) is
++ * msm_geni_serial_handle_isr; it alone consumes the M/S/DMA status. bu.xmit
++ * is the xmit circ buffer (copied into the fixed TX DMA area); bu.rxq is the
++ * TTY flip buffer the RX DMA is pushed into before geni_se_rx_dma_start.
++ * When rxq has no room for a completed RX DMA, the buffer stays owned and
++ * RFR is held not-ready until the worker has made room. */
++#define BU_IRQ 640u
++#define BU_RXQ 65536u
++#define POLL_WAIT_TIMEOUT_MSEC 100
++#define M_IRQ_BITS ((1u<<26)|(1u<<27)|(1u<<4)|(1u<<5))   /* RX_FIFO_WATERMARK/LAST, CMD_CANCEL/ABORT */
++#define S_IRQ_BITS ((1u<<26)|(1u<<27)|(1u<<4)|(1u<<5))
++#define M_ILLEGAL_CMD_EN (1u<<2)
++#define CMD_CANCEL_ABORT_EN ((1u<<4)|(1u<<5))   /* M_/S_CMD_CANCEL_EN | M_/S_CMD_ABORT_EN */
++#define S_RX_FIFO_WR_ERR_EN (1u<<25)
++#define TX_DMA_DONE (1u<<0)
++#define TX_RESET_DONE (1u<<3)
++#define TX_GENI_CANCEL_IRQ (1u<<14)
++#define DMA_TX_IRQ_BITS (TX_RESET_DONE|TX_DMA_DONE|TX_GENI_CANCEL_IRQ|(1u<<1)|(1u<<2))
++#define RX_DMA_DONE (1u<<0)
++#define RX_EOT (1u<<1)
++#define RX_SBE (1u<<2)
++#define RX_RESET_DONE (1u<<3)
++#define UART_DMA_RX_PARITY_ERR (1u<<5)
++#define UART_DMA_RX_ERRS (3u<<5)
++#define UART_DMA_RX_BREAK (3u<<7)
++#define RX_GENI_CANCEL_IRQ (1u<<14)
++#define DMA_RX_IRQ_BITS (RX_EOT|RX_GENI_CANCEL_IRQ|RX_RESET_DONE|UART_DMA_RX_ERRS|UART_DMA_RX_PARITY_ERR|UART_DMA_RX_BREAK|RX_DMA_DONE|RX_SBE)
++#define S_GENI_CMD_ACTIVE (1u<<12)
++#define UART_MANUAL_RFR_EN (1u<<31)
++#define UART_RFR_NOT_READY (1u<<1)
++static LCK_MTX_DECLARE(bu_lock,&bt_sk_grp);
++static struct {
++    vm_offset_t base;
++    uint32_t cur_baud;
++    bool s_cmd_done,manual_flow,tx_busy;
++    unsigned tx_size,xmit_len,hold;
++    uint32_t rx_head,rx_len;
++    uint8_t xmit[0x1000],rxq[BU_RXQ];
++    uint64_t irqs,irq_wakes,tx_bytes,rx_bytes,tx_dmas,rx_dmas,parity,brk,overrun,sbe,illegal,holds,rx_err_drops;
++} bu;
++static void bu_rxq_put_locked(const uint8_t *data,unsigned n)
++{
++    for(unsigned i=0;i<n;++i) bu.rxq[(bu.rx_head+bu.rx_len+i)%BU_RXQ]=data[i];
++    bu.rx_len+=n;
++}
++static void bu_rx_dma_start_locked(void)
++{
++    bt_wr(bu.base,0xd4c,7);bt_wr(bu.base,0xd30,(uint32_t)(BT_IOVA+0x1000));bt_wr(bu.base,0xd34,(uint32_t)((BT_IOVA+0x1000)>>32));
++    bt_wr(bu.base,0xd38,0);bt_wr(bu.base,0xd3c,2048);
++}
++/* msm_geni_serial_prep_dma_tx: setup_tx + geni_se_tx_dma_prep. */
++static void bu_prep_dma_tx_locked(void)
++{
++    unsigned n=bu.xmit_len;
++    for(unsigned i=0;i<n;++i) *(volatile uint8_t *)(bts.nc+i)=bu.xmit[i];
+     __asm__ volatile("dsb sy" ::: "memory");
+-    bt_wr(uart,0x270,bytes);bt_wr(uart,0x600,1u<<27);
+-    bt_wr(uart,0xc4c,7);bt_wr(uart,0xc30,(uint32_t)BT_IOVA);bt_wr(uart,0xc34,(uint32_t)(BT_IOVA>>32));
+-    bt_wr(uart,0xc38,1);bt_wr(uart,0xc3c,bytes);
+-    unsigned ms;
+-    for(ms=0;ms<10000 && !(rd(uart,0xc40)&1);++ms) bt_sleep_ms(1);
+-    uint32_t txs=rd(uart,0xc40);bt_wr(uart,0xc44,txs);bt_wr(uart,0x618,rd(uart,0x610));
+-    if(!(txs&1)) {printf("STAR BT TX: no TX_DMA_DONE in %u ms (tx_irq=%#x geni=%#x)\n",ms,txs,rd(uart,0x40));return ETIMEDOUT;}
+-    return 0;
+-}
+-/* Wait HCI_INIT_TIMEOUT for one event; returns its length (0 on timeout). */
+-static unsigned bt_rx_wait(vm_offset_t uart,const char *name,bool log)
+-{
+-    unsigned ms;
+-    for(ms=0;ms<10000 && !(rd(uart,0xd40)&3);++ms) bt_sleep_ms(1);  /* DMA_DONE | EOT */
+-    uint32_t rxs=rd(uart,0xd40),len=rd(uart,0xd54);bt_wr(uart,0xd44,rxs);
+-    if(!(rxs&3)) {printf("STAR BT RX: %s no event in %u ms\n",name,ms);return 0;}
+-    if(len>2048) len=2048;
+-    if(log) {printf("STAR BT RX: %s len=%u ms=%u\n",name,len,ms);bt_hex("RX EVENT",bts.nc+0x1000,len);}
+-    return len;
+-}
+-static uint8_t bt_ev(unsigned i) {return *(volatile uint8_t *)(bts.nc+0x1000+i);}
+-/* Command complete for opcode with status/cresp 0 (and rtype for EDL replies). */
+-static bool bt_cc(unsigned len,uint16_t opcode,int rtype)
+-{
+-    return len>=7 && bt_ev(0)==4 && bt_ev(1)==0x0e && bt_ev(4)==(opcode&255) && bt_ev(5)==(opcode>>8) &&
+-        bt_ev(6)==0 && (rtype<0 || (len>=8 && bt_ev(7)==rtype));
+-}
+-static int bt_cmd(vm_offset_t uart,uint16_t opcode,const uint8_t *params,unsigned n,int rtype,const char *name)
+-{
+-    uint8_t packet[4+255];
+-    packet[0]=1;packet[1]=opcode&255;packet[2]=opcode>>8;packet[3]=n;
+-    for(unsigned i=0;i<n;++i) packet[4+i]=params[i];
+-    bt_rx_arm(uart);
+-    int e=bt_tx(uart,packet,4+n);if(e) return e;
+-    unsigned len=bt_rx_wait(uart,name,true);
+-    if(!len) return ETIMEDOUT;
+-    return bt_cc(len,opcode,rtype)?0:EIO;
+-}
+-static int bt_edl(vm_offset_t uart,uint8_t request,const char *name)
+-{
+-    return bt_cmd(uart,0xfc00,&request,1,request,name);
+-}
+-/* qca_download_firmware + qca_tlv_send_segment (WCN3991-style command complete acks). */
+-static int bt_download(vm_offset_t uart,const uint8_t *data,unsigned size,bool skip_acks,const char *name)
+-{
+-    uint8_t packet[4+2+243];unsigned segments=0;
+-    bt_rx_arm(uart);
+-    for(unsigned at=0;at<size;) {
+-        unsigned seg=size-at>243?243:size-at;
+-        bool ack=!skip_acks || at+seg==size || seg<243;
+-        packet[0]=1;packet[1]=0x00;packet[2]=0xfc;packet[3]=seg+2;packet[4]=0x1e;packet[5]=seg;
+-        for(unsigned i=0;i<seg;++i) packet[6+i]=data[at+i];
+-        int e=bt_tx(uart,packet,6+seg);
+-        if(e) {printf("STAR BT %s: segment %u TX failed\n",name,segments);return e;}
+-        ++segments;at+=seg;
+-        if(ack) {
+-            unsigned len=bt_rx_wait(uart,name,false);
+-            if(!bt_cc(len,0xfc00,0x1e)) {
+-                printf("STAR BT %s: segment %u not acked (len=%u)\n",name,segments,len);
+-                if(len) bt_hex("RX EVENT",bts.nc+0x1000,len);
+-                return len?EIO:ETIMEDOUT;
+-            }
+-            bt_rx_arm(uart);
+-        } else if(rd(uart,0xd40)&3) {
+-            unsigned len=bt_rx_wait(uart,name,true);
+-            printf("STAR BT %s: unexpected event after segment %u\n",name,segments);
+-            return len?EIO:ETIMEDOUT;
+-        }
+-    }
+-    printf("STAR BT %s: %u bytes in %u segments acked\n",name,size,segments);
+-    return 0;
+-}
+-static void bt_service_sleep(void)
+-{
+-    uint64_t deadline;clock_interval_to_deadline(1,NSEC_PER_MSEC,&deadline);
+-    (void)assert_wait_deadline(&bt_sk,THREAD_UNINT,deadline);thread_block(THREAD_CONTINUE_NULL);
+-}
++    bt_wr(bu.base,0x270,n);bt_wr(bu.base,0x600,1u<<27);
++    bt_wr(bu.base,0xc4c,7);bt_wr(bu.base,0xc30,(uint32_t)BT_IOVA);bt_wr(bu.base,0xc34,(uint32_t)(BT_IOVA>>32));
++    bt_wr(bu.base,0xc38,1);bt_wr(bu.base,0xc3c,n);
++    bu.tx_busy=true;bu.tx_size=n;
++}
++static void bu_set_manual_flow(bool enable)
++{
++    if(!enable) {
++        bt_wr(bu.base,0x2ac,UART_MANUAL_RFR_EN);delay(10);
++        bt_wr(bu.base,0x2ac,UART_MANUAL_RFR_EN|UART_RFR_NOT_READY);
++    } else bt_wr(bu.base,0x2ac,0);
++}
++/* msm_geni_serial_handle_dma_rx; false when the buffer is kept for lack of room. */
++static bool bu_handle_dma_rx_locked(bool drop)
++{
++    if(!(rd(bu.base,0x40)&S_GENI_CMD_ACTIVE)) return true;
++    unsigned n=rd(bu.base,0xd54);
++    if(!n) return true;
++    if(n>2048) n=2048;
++    if(drop) {bu.rx_err_drops+=n;return true;}
++    if(n>BU_RXQ-bu.rx_len) {
++        bu.hold=n;++bu.holds;
++        bu_set_manual_flow(false);
++        return false;
++    }
++    for(unsigned i=0;i<n;++i) {
++        bu.rxq[(bu.rx_head+bu.rx_len+i)%BU_RXQ]=*(volatile uint8_t *)(bts.nc+0x1000+i);
++        *(volatile uint8_t *)(bts.nc+0x1000+i)=0;
++    }
++    bu.rx_len+=n;bu.rx_bytes+=n;
++    return true;
++}
++static bool bu_handle_tx_dma_xfer_locked(uint32_t m,bool *wake)
++{
++    uint32_t st=rd(bu.base,0xc40);
++    if(st) {
++        bt_wr(bu.base,0xc44,st);
++        if(st&(TX_RESET_DONE|TX_GENI_CANCEL_IRQ)) return true;
++        if(st&TX_DMA_DONE) {
++            /* msm_geni_serial_handle_dma_tx */
++            memmove(bu.xmit,bu.xmit+bu.tx_size,bu.xmit_len-bu.tx_size);
++            bu.xmit_len-=bu.tx_size;bu.tx_bytes+=bu.tx_size;++bu.tx_dmas;
++            bu.tx_busy=false;bu.tx_size=0;
++            if(bu.xmit_len) bu_prep_dma_tx_locked();
++            *wake=true;
++        }
++    }
++    return (m&CMD_CANCEL_ABORT_EN)!=0;
++}
++static bool bu_handle_rx_dma_xfer_locked(uint32_t s,bool *wake)
++{
++    bool ret=false,drop=false;
++    uint32_t st=rd(bu.base,0xd40);
++    if(st) {
++        bt_wr(bu.base,0xd44,st);
++        if(st&RX_RESET_DONE) return true;
++        if(st&UART_DMA_RX_ERRS) {
++            if(st&UART_DMA_RX_PARITY_ERR) ++bu.parity;
++            drop=true;
++        } else if(st&UART_DMA_RX_BREAK) ++bu.brk;
++        if(st&(RX_EOT|RX_DMA_DONE)) {
++            ++bu.rx_dmas;
++            if(bu_handle_dma_rx_locked(drop) && !(st&RX_GENI_CANCEL_IRQ)) bu_rx_dma_start_locked();
++            *wake=true;
++        }
++        if(st&RX_SBE) ++bu.sbe;
++        if(st&(RX_EOT|RX_GENI_CANCEL_IRQ|RX_DMA_DONE)) ret=true;
++    }
++    if(s&CMD_CANCEL_ABORT_EN) ret=true;
++    return ret;
++}
++/* msm_geni_serial_handle_isr (DMA mode). */
++static void bu_isr(void *arg __unused)
++{
++    bool wake=false,s_done=false;
++    lck_mtx_lock(&bu_lock);
++    ++bu.irqs;
++    uint32_t m=rd(bu.base,0x610),s=rd(bu.base,0x640);
++    bt_wr(bu.base,0x618,m);bt_wr(bu.base,0x648,s);
++    if(m&M_ILLEGAL_CMD_EN) {++bu.illegal;wake=true;goto out;}
++    if(s&S_RX_FIFO_WR_ERR_EN) {
++        /* tty_insert_flip_char(tport, 0, TTY_OVERRUN): hci_ldisc ignores the flag. */
++        static const uint8_t zero=0;
++        ++bu.overrun;wake=true;
++        if(bu.rx_len<BU_RXQ) bu_rxq_put_locked(&zero,1);
++    }
++    (void)bu_handle_tx_dma_xfer_locked(m,&wake);
++    s_done=bu_handle_rx_dma_xfer_locked(s,&wake);
++out:
++    if(s_done) {bu.s_cmd_done=true;wakeup(&bu.s_cmd_done);}
++    lck_mtx_unlock(&bu_lock);
++    if(wake) {++bu.irq_wakes;bt_kick();}
++}
++static void bu_enable_interrupts(void)
++{
++    bt_wr(bu.base,0x614,rd(bu.base,0x614)|M_IRQ_BITS);
++    bt_wr(bu.base,0x644,rd(bu.base,0x644)|S_IRQ_BITS);
++    bt_wr(bu.base,0xc4c,DMA_TX_IRQ_BITS);bt_wr(bu.base,0xd4c,DMA_RX_IRQ_BITS);
++}
++/* geni_wait_for_cmd_done, interrupt case: true on timeout. */
++static bool bu_wait_s_cmd_done(void)
++{
++    uint64_t deadline;clock_interval_to_deadline(POLL_WAIT_TIMEOUT_MSEC,NSEC_PER_MSEC,&deadline);
++    lck_mtx_lock(&bu_lock);
++    while(!bu.s_cmd_done &&
++        lck_mtx_sleep_deadline(&bu_lock,LCK_SLEEP_DEFAULT,(event_t)&bu.s_cmd_done,THREAD_UNINT,deadline)!=THREAD_TIMED_OUT) {}
++    bool timeout=!bu.s_cmd_done;
++    lck_mtx_unlock(&bu_lock);
++    return timeout;
++}
++static void bu_issue_s_ctrl(uint32_t value)
++{
++    lck_mtx_lock(&bu_lock);bu.s_cmd_done=false;bt_wr(bu.base,0x634,value);lck_mtx_unlock(&bu_lock);
++}
++static void bu_stop_rx_sequencer(void)
++{
++    vm_offset_t u=bu.base;
++    if(!(rd(u,0x40)&S_GENI_CMD_ACTIVE)) return;
++    bu_set_manual_flow(false);
++    delay(2*(160u*1000000u/bu.cur_baud)+500);
++    lck_mtx_lock(&bu_lock);
++    if(rd(u,0xd40)) {
++        /* Completion reached the hardware before its interrupt ran. */
++        uint32_t s=rd(u,0x640);bool wake=false;
++        bt_wr(u,0x648,s);
++        printf("STAR BT UART: stop_rx interrupt delay rx_dma=%#x s_irq=%#x\n",rd(u,0xd40),s);
++        (void)bu_handle_rx_dma_xfer_locked(s,&wake);
++        if(wake) bt_kick();
++    }
++    lck_mtx_unlock(&bu_lock);
++    bu_issue_s_ctrl(1u<<2);                                      /* geni_cancel_s_cmd */
++    bool timeout=bu_wait_s_cmd_done(),active=(rd(u,0x40)&S_GENI_CMD_ACTIVE)!=0;
++    if(timeout || active) {
++        printf("STAR BT UART: stop_rx cancel failed timeout:%u is_rx_active:%u status=%#x dma_dbg=%#x\n",timeout,active,rd(u,0x40),rd(u,0xe40));
++        bu_issue_s_ctrl(1u<<1);                                  /* geni_abort_s_cmd */
++        timeout=bu_wait_s_cmd_done();active=(rd(u,0x40)&S_GENI_CMD_ACTIVE)!=0;
++        if(timeout || active) printf("STAR BT UART: stop_rx abort fail timeout:%u is_rx_active:%u status=%#x\n",timeout,active,rd(u,0x40));
++        lck_mtx_lock(&bu_lock);bu.s_cmd_done=false;bt_wr(u,0xd58,1);lck_mtx_unlock(&bu_lock);
++        if(bu_wait_s_cmd_done()) printf("STAR BT UART: stop_rx rx fsm reset failed\n");
++    }
++    bu_enable_interrupts();
++    bu_set_manual_flow(true);
++}
++static void bu_start_rx_sequencer(void)
++{
++    if(rd(bu.base,0x40)&S_GENI_CMD_ACTIVE) {
++        lck_mtx_lock(&bu_lock);bu_rx_dma_start_locked();lck_mtx_unlock(&bu_lock);
++        bu_stop_rx_sequencer();
++    }
++    lck_mtx_lock(&bu_lock);
++    if(bu.hold) {printf("STAR BT UART: start_rx drops %u held RX bytes\n",bu.hold);bu.hold=0;}
++    bu_rx_dma_start_locked();
++    bt_wr(bu.base,0x630,(1u<<27)|(1u<<7));                      /* UART_START_READ | RFR_OPEN */
++    bu_enable_interrupts();
++    lck_mtx_unlock(&bu_lock);
++}
++/* msm_geni_serial_set_mctrl: RTS off = manual RFR not-ready. */
++static void bu_set_mctrl(bool rts)
++{
++    lck_mtx_lock(&bu_lock);
++    bu.manual_flow=!rts;
++    bt_wr(bu.base,0x2ac,rts?0:(UART_MANUAL_RFR_EN|UART_RFR_NOT_READY));
++    lck_mtx_unlock(&bu_lock);
++}
++/* msm_geni_serial_set_termios, 8N1, HALF_SAMPLING (16x); geni_se_clk_freq_match
++ * (exact=false) over the SE7 table of gcc-shima.c. */
++static void bu_set_termios(uint32_t baud,bool crtscts)
++{
++    static const uint32_t table[]={7372800,14745600,19200000,29491200,32000000,
++        48000000,64000000,75000000,80000000,96000000,100000000};
++    vm_offset_t u=bu.base;
++    bu_stop_rx_sequencer();
++    bu.cur_baud=baud;
++    uint32_t desired=baud*16,clk=0,best=0;
++    for(unsigned i=0;i<sizeof(table)/sizeof(table[0]);++i) {
++        uint32_t div=(table[i]+desired-1)/desired,delta=desired-table[i]/div;
++        if(!best || delta<best) {clk=table[i];if(!delta) break;best=delta;}
++    }
++    uint32_t div=(clk+desired-1)/desired;
++    int e=star_gpu_clock_set_rate(STAR_CLK_SE7,clk);
++    bt_wr(u,0x48,1u|(div<<4));bt_wr(u,0x4c,1u|(div<<4));(void)rd(u,0x48);
++    /* msm_geni_serial_termios_cfg */
++    uint32_t tx_trans=rd(u,0x25c)&~1u,tx_parity=rd(u,0x2a4)&~1u,rx_trans=rd(u,0x280)&~(1u<<3),rx_parity=rd(u,0x2a8)&~1u;
++    tx_trans=crtscts?tx_trans&~2u:tx_trans|2u;
++    bt_wr(u,0x22c,0);bt_wr(u,0x25c,tx_trans);bt_wr(u,0x2a4,tx_parity);bt_wr(u,0x280,rx_trans);bt_wr(u,0x2a8,rx_parity);
++    bt_wr(u,0x268,8);bt_wr(u,0x28c,8);bt_wr(u,0x26c,0);
++    if(crtscts) bt_wr(u,0x2ac,0);
++    printf("STAR BT UART: termios %u 8N1%s: src %u Hz (set_rate error %d, provider %u Hz) div %u -> %u bps, CLK_CFG M/S %#x/%#x\n",
++        baud,crtscts?" CRTSCTS":"",clk,e,star_gpu_clock_get_rate(STAR_CLK_SE7),div,clk/div/16,rd(u,0x48),rd(u,0x4c));
++    bu_start_rx_sequencer();
++}
++/* Whole buffer into xmit, or nothing; the caller is the only writer. */
++static bool bu_write(const uint8_t *data,unsigned n)
++{
++    lck_mtx_lock(&bu_lock);
++    bool ok=n<=sizeof(bu.xmit)-bu.xmit_len;
++    if(ok && n) {
++        memcpy(bu.xmit+bu.xmit_len,data,n);bu.xmit_len+=n;
++        if(!bu.tx_busy) bu_prep_dma_tx_locked();
++    }
++    lck_mtx_unlock(&bu_lock);
++    return ok;
++}
++static unsigned bu_room(void)
++{
++    lck_mtx_lock(&bu_lock);unsigned n=sizeof(bu.xmit)-bu.xmit_len;lck_mtx_unlock(&bu_lock);
++    return n;
++}
++static bool bu_tx_empty(void)
++{
++    lck_mtx_lock(&bu_lock);bool empty=!bu.tx_busy && !bu.xmit_len;lck_mtx_unlock(&bu_lock);
++    return empty;
++}
++
++/* H4/IBS worker (hci_qca): one byte stream for setup and service. Setup
++ * commands wait for their command complete like __hci_cmd_sync_ev; after
++ * setup (QCA_IBS_DISABLED cleared) host bytes follow qca_enqueue: ASLEEP ->
++ * WAKE_IND, WAKING until WAKE_ACK with the 100 ms wake_retrans, AWAKE
++ * re-arms the 2000 ms tx_idle_delay on enqueue, whose expiry sends
++ * SLEEP_IND. Device WAKE_IND is acknowledged, SLEEP_IND marks RX asleep.
++ * ACL debug logs (QCA_DEBUG_HANDLE) go to diag, not the host. The worker
++ * sleeps on bt_work until an interrupt, a Skywalk TX/RX-space signal or the
++ * earliest pending deadline. */
+ #define HCI_IBS_SLEEP_IND 0xfe
+ #define HCI_IBS_WAKE_IND 0xfd
+ #define HCI_IBS_WAKE_ACK 0xfc
+ #define QCA_DEBUG_HANDLE 0x2edc
++static struct {
++    bool ibs,service,rx_awake,waiting,done;
++    enum {TX_ASLEEP,TX_WAKING,TX_AWAKE} tx_ibs;
++    uint64_t retrans,idle,retrans_ticks,idle_ticks,last_stats;
++    uint8_t ctrl[16];unsigned ctrl_len;
++    uint8_t cmd[4+255];unsigned cmd_len;
++    uint16_t wait_opcode;
++    uint8_t ev[3+255];unsigned ev_len;             /* H4 event packet, ev[0]=4 */
++    /* h4_recv_buf state */
++    uint8_t type,hdr[4];unsigned need,got,body;bool drop;
++    uint8_t fwd[2048];unsigned fwd_len,fwd_off;
++    uint64_t wakes,wacks,slps,recv_wakes,recv_wacks,recv_slps,diag,bad,setup_drops,unrouted;
++    uint64_t waits,timeouts,last_errors;
++} bw;
++static bool bt_flush(void)
++{
++    while(bw.fwd_off<bw.fwd_len) {
++        uint32_t n=renoir_bt_sk_rx_put(bw.fwd+bw.fwd_off,bw.fwd_len-bw.fwd_off);
++        if(!n) return false;
++        bw.fwd_off+=n;
++    }
++    bw.fwd_len=bw.fwd_off=0;
++    return true;
++}
++static void bt_stage(const uint8_t *data,unsigned n)
++{
++    memcpy(bw.fwd+bw.fwd_len,data,n);bw.fwd_len+=n;
++}
++static void bt_ibs_send(uint8_t byte)
++{
++    if(bw.ctrl_len<sizeof(bw.ctrl)) bw.ctrl[bw.ctrl_len++]=byte;
++}
++static void bt_event(void)
++{
++    if(bw.waiting && !bw.done && bw.ev[1]==0x0e && bw.ev_len>=6 && (bw.ev[4]|(bw.ev[5]<<8))==bw.wait_opcode) {
++        bw.done=true;return;
++    }
++    if(bw.service) {bt_stage(bw.ev,bw.ev_len);return;}
++    ++bw.unrouted;
++    bt_hex("RX unrouted event",bw.ev,bw.ev_len);
++}
++/* qca_recv: returns the bytes consumed; stops while Skywalk has no room. */
++static unsigned bt_parse(const uint8_t *in,unsigned len)
++{
++    unsigned i=0;
++    while(i<len) {
++        if(!bt_flush()) return i;
++        if(!bw.need && !bw.body) {
++            uint8_t b=in[i++];
++            if(b==HCI_IBS_WAKE_IND) {
++                ++bw.recv_wakes;bw.rx_awake=true;bt_ibs_send(HCI_IBS_WAKE_ACK);++bw.wacks;
++            } else if(b==HCI_IBS_SLEEP_IND) {++bw.recv_slps;bw.rx_awake=false;}
++            else if(b==HCI_IBS_WAKE_ACK) {
++                ++bw.recv_wacks;
++                if(bw.tx_ibs==TX_WAKING) {bw.tx_ibs=TX_AWAKE;bw.idle=mach_absolute_time()+bw.idle_ticks;}
++            } else if(b==2 || b==5) {bw.type=b;bw.need=4;bw.got=0;}
++            else if(b==3) {bw.type=b;bw.need=3;bw.got=0;}
++            else if(b==4) {bw.type=b;bw.need=2;bw.got=0;}
++            else {
++                /* h4_recv_buf: unknown type -> -EILSEQ, rest of the received data dropped */
++                ++bw.bad;printf("STAR BT H4: unknown packet type %#x, %u bytes dropped\n",b,len-i+1);
++                return len;
++            }
++            continue;
++        }
++        if(bw.need) {
++            bw.hdr[bw.got++]=in[i++];
++            if(bw.got<bw.need) continue;
++            bw.need=0;
++            uint8_t t=bw.type;
++            bw.body=t==4?bw.hdr[1]:t==3?bw.hdr[2]:t==2?(unsigned)(bw.hdr[2]|(bw.hdr[3]<<8)):(unsigned)((bw.hdr[2]|(bw.hdr[3]<<8))&0x3fff);
++            bw.drop=t!=4 && (!bw.service || (t==2 && (bw.hdr[0]|(bw.hdr[1]<<8))==QCA_DEBUG_HANDLE));
++            if(t!=4 && bw.drop) {if(bw.service) ++bw.diag; else ++bw.setup_drops;}
++            if(t==4) {bw.ev[0]=4;bw.ev[1]=bw.hdr[0];bw.ev[2]=bw.hdr[1];bw.ev_len=3;}
++            else if(!bw.drop) {bt_stage(&t,1);bt_stage(bw.hdr,bw.got);}
++            if(!bw.body && t==4) bt_event();
++            continue;
++        }
++        unsigned n=len-i<bw.body?len-i:bw.body;
++        if(bw.type==4) {memcpy(bw.ev+bw.ev_len,in+i,n);bw.ev_len+=n;}
++        else if(!bw.drop) {if(n>sizeof(bw.fwd)) n=sizeof(bw.fwd);bt_stage(in+i,n);}
++        i+=n;bw.body-=n;
++        if(!bw.body && bw.type==4) bt_event();
++    }
++    (void)bt_flush();
++    return i;
++}
++static void bt_rx_process(void)
++{
++    static uint8_t chunk[2048];
++    for(;;) {
++        lck_mtx_lock(&bu_lock);
++        unsigned n=bu.rx_len<sizeof(chunk)?bu.rx_len:sizeof(chunk);
++        for(unsigned i=0;i<n;++i) chunk[i]=bu.rxq[(bu.rx_head+i)%BU_RXQ];
++        lck_mtx_unlock(&bu_lock);
++        unsigned used=n?bt_parse(chunk,n):(bt_flush(),0);
++        lck_mtx_lock(&bu_lock);
++        bu.rx_head=(bu.rx_head+used)%BU_RXQ;bu.rx_len-=used;
++        if(bu.hold && bu.hold<=BU_RXQ-bu.rx_len) {
++            /* The held RX DMA: push, re-arm, release RFR. */
++            for(unsigned i=0;i<bu.hold;++i) {
++                bu.rxq[(bu.rx_head+bu.rx_len+i)%BU_RXQ]=*(volatile uint8_t *)(bts.nc+0x1000+i);
++                *(volatile uint8_t *)(bts.nc+0x1000+i)=0;
++            }
++            bu.rx_len+=bu.hold;bu.rx_bytes+=bu.hold;bu.hold=0;
++            bu_rx_dma_start_locked();
++            if(!bu.manual_flow) bt_wr(bu.base,0x2ac,0);
++        }
++        bool more=bu.rx_len!=0;
++        lck_mtx_unlock(&bu_lock);
++        if(!n || used<n || !more) return;
++    }
++}
++static void bt_stats(const char *why)
++{
++    lck_mtx_lock(&bu_lock);
++    printf("STAR BT STATS(%s): irq=%llu irq_wakes=%llu waits=%llu deadline_wakes=%llu tx=%llu B/%llu DMA rx=%llu B/%llu DMA "
++        "parity=%llu break=%llu overrun=%llu sbe=%llu illegal=%llu rx_err_drop=%llu holds=%llu "
++        "IBS sent wake=%llu wack=%llu sleep=%llu recv wake=%llu wack=%llu sleep=%llu H4 bad=%llu diag=%llu setup_drop=%llu unrouted=%llu sk_tx=%llu sk_rx=%llu sk_rx_dropped=%llu\n",
++        why,bu.irqs,bu.irq_wakes,bw.waits,bw.timeouts,bu.tx_bytes,bu.tx_dmas,bu.rx_bytes,bu.rx_dmas,
++        bu.parity,bu.brk,bu.overrun,bu.sbe,bu.illegal,bu.rx_err_drops,bu.holds,
++        bw.wakes,bw.wacks,bw.slps,bw.recv_wakes,bw.recv_wacks,bw.recv_slps,bw.bad,bw.diag,bw.setup_drops,bw.unrouted,
++        bt_sk_kicks_tx,bt_sk_kicks_rx,bt_sk.rx_dropped);
++    lck_mtx_unlock(&bu_lock);
++}
++/* One worker pass: RX, IBS deadlines, TX; then sleep until a signal or the
++ * earliest of `deadline` (0: none) and the armed IBS deadline. */
++static void bt_pump(uint64_t deadline)
++{
++    bt_rx_process();
++    uint64_t now=mach_absolute_time();
++    bool pending=bw.cmd_len || (bw.service && renoir_bt_sk_tx_pending());
++    if(bw.ibs) {
++        if(pending && bw.tx_ibs==TX_ASLEEP) {
++            bw.tx_ibs=TX_WAKING;bt_ibs_send(HCI_IBS_WAKE_IND);++bw.wakes;bw.retrans=now+bw.retrans_ticks;
++        } else if(bw.tx_ibs==TX_WAKING && now>=bw.retrans) {
++            bt_ibs_send(HCI_IBS_WAKE_IND);++bw.wakes;bw.retrans=now+bw.retrans_ticks;
++        }
++    }
++    if(bw.ctrl_len && bu_write(bw.ctrl,bw.ctrl_len)) bw.ctrl_len=0;
++    if(!bw.ctrl_len && (!bw.ibs || bw.tx_ibs==TX_AWAKE)) {
++        bool sent=false;
++        if(bw.cmd_len && bu_write(bw.cmd,bw.cmd_len)) {bw.cmd_len=0;sent=true;}
++        if(!bw.cmd_len && bw.service) {
++            static uint8_t out[0x1000];
++            unsigned room=bu_room();
++            uint32_t n=room?renoir_bt_sk_tx_take(out,room):0;
++            if(n) {(void)bu_write(out,n);sent=true;}
++        }
++        if(bw.ibs && sent) bw.idle=now+bw.idle_ticks;
++        pending=bw.cmd_len || (bw.service && renoir_bt_sk_tx_pending());
++        if(bw.ibs && bw.tx_ibs==TX_AWAKE && !pending && now>=bw.idle) {
++            bt_ibs_send(HCI_IBS_SLEEP_IND);++bw.slps;bw.tx_ibs=TX_ASLEEP;
++            if(bu_write(bw.ctrl,bw.ctrl_len)) bw.ctrl_len=0;
++            if(bw.service && now-bw.last_stats>=30*bw.idle_ticks/2) {bt_stats("tx sleep");bw.last_stats=now;}
++        }
++    }
++    uint64_t errors=bu.parity+bu.brk+bu.overrun+bu.sbe+bu.illegal+bw.bad;
++    if(errors!=bw.last_errors) {bw.last_errors=errors;bt_stats("error");}
++    uint64_t next=deadline;
++    if(bw.ibs && bw.tx_ibs==TX_WAKING && (!next || bw.retrans<next)) next=bw.retrans;
++    if(bw.ibs && bw.tx_ibs==TX_AWAKE && (!next || bw.idle<next)) next=bw.idle;
++    ++bw.waits;
++    if(!next) (void)semaphore_wait(bt_work);
++    else if(semaphore_wait_deadline(bt_work,next)==KERN_OPERATION_TIMED_OUT) ++bw.timeouts;
++}
++/* __hci_cmd_send: queued once the previous command left for the UART. */
++static int bt_send(const uint8_t *packet,unsigned n,uint64_t deadline)
++{
++    while(bw.cmd_len && mach_absolute_time()<deadline) bt_pump(deadline);
++    if(bw.cmd_len) return ETIMEDOUT;
++    memcpy(bw.cmd,packet,n);bw.cmd_len=n;
++    while(bw.cmd_len && mach_absolute_time()<deadline) bt_pump(deadline);
++    return bw.cmd_len?ETIMEDOUT:0;
++}
++/* __hci_cmd_sync_ev(event 0): command complete for opcode in HCI_INIT_TIMEOUT;
++ * status 0 (and the EDL rtype when given). */
++static int bt_cmd(uint16_t opcode,const uint8_t *params,unsigned n,int rtype,const char *name,bool log)
++{
++    uint8_t packet[4+255];
++    packet[0]=1;packet[1]=opcode&255;packet[2]=opcode>>8;packet[3]=n;
++    for(unsigned i=0;i<n;++i) packet[4+i]=params[i];
++    uint64_t start=mach_absolute_time(),deadline;clock_interval_to_deadline(10000,NSEC_PER_MSEC,&deadline);
++    bw.wait_opcode=opcode;bw.done=false;bw.waiting=true;
++    int e=bt_send(packet,4+n,deadline);
++    while(!e && !bw.done && mach_absolute_time()<deadline) bt_pump(deadline);
++    bw.waiting=false;
++    uint64_t ns;absolutetime_to_nanoseconds(mach_absolute_time()-start,&ns);
++    if(!bw.done) {printf("STAR BT RX: %s no command complete in %llu ms%s\n",name,ns/NSEC_PER_MSEC,e?" (not sent)":"");return ETIMEDOUT;}
++    if(log) {printf("STAR BT RX: %s ms=%llu\n",name,ns/NSEC_PER_MSEC);bt_hex("RX EVENT",bw.ev,bw.ev_len);}
++    return bw.ev_len>=7 && bw.ev[6]==0 && (rtype<0 || (bw.ev_len>=8 && bw.ev[7]==rtype))?0:EIO;
++}
++static int bt_edl(uint8_t request,const char *name)
++{
++    return bt_cmd(0xfc00,&request,1,request,name,true);
++}
++/* qca_download_firmware + qca_tlv_send_segment (WCN3991-style command complete acks). */
++static int bt_download(const uint8_t *data,unsigned size,bool skip_acks,const char *name)
++{
++    uint8_t packet[4+2+243];unsigned segments=0;
++    uint64_t start=mach_absolute_time(),ns;
++    for(unsigned at=0;at<size;) {
++        unsigned seg=size-at>243?243:size-at;
++        bool ack=!skip_acks || at+seg==size || seg<243;
++        int e;
++        if(ack) {
++            packet[0]=0x1e;packet[1]=seg;
++            for(unsigned i=0;i<seg;++i) packet[2+i]=data[at+i];
++            e=bt_cmd(0xfc00,packet,2+seg,0x1e,name,false);
++        } else {
++            packet[0]=1;packet[1]=0x00;packet[2]=0xfc;packet[3]=seg+2;packet[4]=0x1e;packet[5]=seg;
++            for(unsigned i=0;i<seg;++i) packet[6+i]=data[at+i];
++            uint64_t deadline;clock_interval_to_deadline(10000,NSEC_PER_MSEC,&deadline);
++            e=bt_send(packet,6+seg,deadline);
++        }
++        ++segments;at+=seg;
++        if(e) {
++            printf("STAR BT %s: segment %u failed (%d)\n",name,segments,e);
++            if(e==EIO) bt_hex("RX EVENT",bw.ev,bw.ev_len);
++            return e;
++        }
++    }
++    absolutetime_to_nanoseconds(mach_absolute_time()-start,&ns);
++    printf("STAR BT %s: %u bytes in %u segments acked, %llu ms\n",name,size,segments,ns/NSEC_PER_MSEC);
++    return 0;
++}
+ /* hci_dev_setup after hdev->setup: with a public address property the core
+  * calls hdev->set_bdaddr = qca_set_bdaddr (EDL_WRITE_BD_ADDR 0xfc14, the
+  * address byte-swapped, __hci_cmd_sync_ev for HCI_INIT_TIMEOUT) before the
+@@ -287,114 +699,17 @@
+     for(unsigned i=0;i<6;++i) if(address[i]) return true;
+     return false;
+ }
+-static __attribute__((noreturn)) void bt_service(vm_offset_t uart,const char *label)
+-{
+-    enum {TX_ASLEEP,TX_WAKING,TX_AWAKE} tx_ibs=TX_ASLEEP;
+-    bool rx_awake=false,armed=false;
+-    uint8_t type=0,hdr[4];unsigned need=0,got=0,body=0;bool drop=false;
+-    static uint8_t out[0x1000],in[2048],event[2+255];
+-    unsigned event_len=0;
+-    uint64_t retrans=0,idle=0,retrans_ticks,idle_ticks,init_ticks,deadline=0;
+-    nanoseconds_to_absolutetime(100*NSEC_PER_MSEC,&retrans_ticks);
+-    nanoseconds_to_absolutetime(2000*NSEC_PER_MSEC,&idle_ticks);
+-    nanoseconds_to_absolutetime(10000*NSEC_PER_MSEC,&init_ticks);
+-    uint64_t wakes=0,wacks=0,slps=0,recv_wakes=0,recv_wacks=0,recv_slps=0,diag=0,bad=0;
+-    uint8_t address[6],command[4+6];bool command_pending=false,awaiting=false;
+-    if(bt_local_address(address)) {
+-        command[0]=1;command[1]=0x14;command[2]=0xfc;command[3]=6;
+-        for(unsigned i=0;i<6;++i) command[4+i]=address[5-i];      /* baswap */
+-        command_pending=true;
+-        printf("STAR BT SERVICE: set_bdaddr %02x:%02x:%02x:%02x:%02x:%02x via EDL_WRITE_BD_ADDR\n",
+-            address[0],address[1],address[2],address[3],address[4],address[5]);
+-    } else {
+-        printf("STAR BT SERVICE: no ADT local-mac-address; controller keeps its NVM address\n");
+-        renoir_bt_sk_boot_result(0,label);
+-    }
+-    printf("STAR BT SERVICE: UART owned, IBS tx/rx ASLEEP, wake_retrans=100 ms tx_idle=2000 ms, 1 ms poll\n");
+-    for(;;) {
+-        unsigned n_out=0;
+-        if(!armed && renoir_bt_sk_rx_space()>=2048) {bt_rx_arm(uart);armed=true;}
+-        uint32_t rxs=rd(uart,0xd40);
+-        if(armed && (rxs&3)) {
+-            unsigned len=rd(uart,0xd54);bt_wr(uart,0xd44,rxs);armed=false;
+-            if(len>2048) len=2048;
+-            for(unsigned i=0;i<len;++i) in[i]=*(volatile uint8_t *)(bts.nc+0x1000+i);
+-            for(unsigned i=0;i<len;) {
+-                if(!need && !body) {
+-                    uint8_t b=in[i++];
+-                    if(b==HCI_IBS_WAKE_IND) {
+-                        ++recv_wakes;rx_awake=true;out[n_out++]=HCI_IBS_WAKE_ACK;++wacks;
+-                    } else if(b==HCI_IBS_SLEEP_IND) {++recv_slps;rx_awake=false;}
+-                    else if(b==HCI_IBS_WAKE_ACK) {
+-                        ++recv_wacks;
+-                        if(tx_ibs==TX_WAKING) {tx_ibs=TX_AWAKE;idle=mach_absolute_time()+idle_ticks;}
+-                    } else if(b==2 || b==5) {type=b;need=4;got=0;}
+-                    else if(b==3) {type=b;need=3;got=0;}
+-                    else if(b==4) {type=b;need=2;got=0;}
+-                    else {
+-                        /* h4_recv_buf: unknown type -> -EILSEQ, rest of the buffer dropped */
+-                        ++bad;printf("STAR BT SERVICE: unknown H4 type %#x, %u bytes dropped\n",b,len-i+1);break;
+-                    }
+-                    continue;
+-                }
+-                if(need) {
+-                    hdr[got++]=in[i++];
+-                    if(got<need) continue;
+-                    need=0;
+-                    body=type==4?hdr[1]:type==3?hdr[2]:type==2?(unsigned)(hdr[2]|(hdr[3]<<8)):(unsigned)((hdr[2]|(hdr[3]<<8))&0x3fff);
+-                    drop=type==2 && (hdr[0]|(hdr[1]<<8))==QCA_DEBUG_HANDLE;
+-                    if(drop) ++diag;
+-                    else if(type==4) {event[0]=hdr[0];event[1]=hdr[1];event_len=2;}
+-                    else {renoir_bt_sk_rx_put(&type,1);renoir_bt_sk_rx_put(hdr,got);}
+-                    if(body) continue;
+-                } else {
+-                    unsigned n=len-i<body?len-i:body;
+-                    if(type==4) {memcpy(event+event_len,in+i,n);event_len+=n;}
+-                    else if(!drop) renoir_bt_sk_rx_put(in+i,n);
+-                    i+=n;body-=n;
+-                    if(body) continue;
+-                }
+-                if(type!=4) continue;
+-                /* A complete event: the set_bdaddr reply is consumed here. */
+-                if(awaiting && event[0]==0x0e && event_len>=6 && event[3]==0x14 && event[4]==0xfc) {
+-                    awaiting=false;
+-                    printf("STAR BT SERVICE: EDL_WRITE_BD_ADDR status=%#x\n",event[5]);
+-                    renoir_bt_sk_boot_result(event[5]?EIO:0,label);
+-                    continue;
+-                }
+-                renoir_bt_sk_rx_put(&type,1);renoir_bt_sk_rx_put(event,event_len);
+-            }
+-        }
+-        uint64_t now=mach_absolute_time();
+-        if(awaiting && now>=deadline) {
+-            awaiting=false;printf("STAR BT SERVICE: EDL_WRITE_BD_ADDR no reply in 10 s\n");
+-            renoir_bt_sk_boot_result(ETIMEDOUT,label);
+-        }
+-        if(tx_ibs==TX_WAKING && now>=retrans) {out[n_out++]=HCI_IBS_WAKE_IND;++wakes;retrans=now+retrans_ticks;}
+-        if(tx_ibs==TX_AWAKE && now>=idle) {out[n_out++]=HCI_IBS_SLEEP_IND;++slps;tx_ibs=TX_ASLEEP;}
+-        if(command_pending || renoir_bt_sk_tx_pending()) {
+-            if(tx_ibs==TX_ASLEEP) {
+-                tx_ibs=TX_WAKING;out[n_out++]=HCI_IBS_WAKE_IND;++wakes;retrans=now+retrans_ticks;
+-            } else if(tx_ibs==TX_AWAKE) {
+-                if(command_pending) {
+-                    memcpy(out+n_out,command,sizeof(command));n_out+=sizeof(command);
+-                    command_pending=false;awaiting=true;deadline=now+init_ticks;
+-                }
+-                n_out+=renoir_bt_sk_tx_take(out+n_out,sizeof(out)-n_out);
+-                idle=now+idle_ticks;
+-            }
+-        }
+-        if(n_out && bt_tx(uart,out,n_out))
+-            printf("STAR BT SERVICE: TX of %u bytes failed (IBS sent wake=%llu wack=%llu sleep=%llu recv wake=%llu wack=%llu sleep=%llu rx_awake=%u)\n",
+-                n_out,wakes,wacks,slps,recv_wakes,recv_wacks,recv_slps,rx_awake);
+-        if(bad || diag) {printf("STAR BT SERVICE: diag ACL=%llu bad frames=%llu\n",diag,bad);bad=diag=0;}
+-        bt_service_sleep();
+-    }
++static __attribute__((noreturn)) void bt_service(void)
++{
++    printf("STAR BT SERVICE: UART owned, IRQ %u driven, IBS tx/rx ASLEEP, wake_retrans=100 ms tx_idle=2000 ms\n",BU_IRQ);
++    bw.service=true;
++    bt_stats("service start");bw.last_stats=mach_absolute_time();
++    for(;;) bt_pump(0);
+ }
+ static void renoir_bluetooth_hci_run(void *arg __unused,wait_result_t result __unused)
+ {
+     struct star_gpu_icc *core=NULL,*ddr=NULL;
+-    vm_offset_t uart=0;unsigned clocks=0;int e=0;bool powered=false,rx_started=false,smmu=false;
++    vm_offset_t uart=0;unsigned clocks=0;int e=0;bool powered=false,smmu=false,irq=false;
+     const enum star_gpu_clock_id order[]={STAR_CLK_QUP0_M_AHB,STAR_CLK_QUP0_S_AHB,STAR_CLK_SE7};
+     unsigned wl=bt_gpio_in(64);
+     printf("STAR BT POWER: rails=shared Wi-Fi votes (BT minimums equal); WLAN_EN=%u SW_CTRL=%u before\n",wl,bt_gpio_in(91));
+@@ -430,19 +745,21 @@
+     /* geni_se_select_dma_mode (UART keeps its M IRQ enables) */
+     bt_wr(uart,0xe18,0);bt_wr(uart,0x618,~0u);bt_wr(uart,0x648,~0u);bt_wr(uart,0xc44,~0u);bt_wr(uart,0xd44,~0u);
+     bt_wr(uart,0xe1c,~0u);bt_wr(uart,0x258,rd(uart,0x258)|1u);
+-    /* set_termios 115200 8N1 CRTSCTS: 7.3728 MHz / (115200*16) = 4 */
+-    bt_wr(uart,0x48,1u|(4u<<4));bt_wr(uart,0x4c,1u|(4u<<4));(void)rd(uart,0x48);
+-    bt_wr(uart,0x22c,0);
+-    bt_wr(uart,0x25c,rd(uart,0x25c)&~3u);bt_wr(uart,0x2a4,rd(uart,0x2a4)&~1u);
+-    bt_wr(uart,0x280,rd(uart,0x280)&~(1u<<3));bt_wr(uart,0x2a8,rd(uart,0x2a8)&~1u);
+-    bt_wr(uart,0x268,8);bt_wr(uart,0x28c,8);bt_wr(uart,0x26c,0);bt_wr(uart,0x2ac,0);
+-    /* start_rx_sequencer: START_READ | RFR_OPEN; each bt_edl arms its RX DMA */
+-    bt_wr(uart,0xd4c,7);bt_wr(uart,0xd30,(uint32_t)(BT_IOVA+0x1000));bt_wr(uart,0xd34,(uint32_t)((BT_IOVA+0x1000)>>32));
+-    bt_wr(uart,0xd38,0);bt_wr(uart,0xd3c,2048);
+-    bt_wr(uart,0x630,(1u<<27)|(1u<<7));rx_started=true;                 /* geni_setup_s_cmd */
+-    printf("STAR BT UART: 115200 8N1 CRTSCTS SE_DMA depth=%u status=%#x clk=%u\n",depth,rd(uart,0x40),star_gpu_clock_get_rate(STAR_CLK_SE7));
+-    e=bt_edl(uart,0x19,"EDL_PATCH_VER_REQ");
+-    if(!e) e=bt_edl(uart,0x23,"EDL_GET_BID_REQ");
++    /* Worker state and the SE interrupt (IRQF_NOAUTOEN in MiCode: visible
++     * only after the port state and DMA mapping exist). */
++    bu.base=uart;bu.cur_baud=115200;
++    nanoseconds_to_absolutetime(100*NSEC_PER_MSEC,&bw.retrans_ticks);
++    nanoseconds_to_absolutetime(2000*NSEC_PER_MSEC,&bw.idle_ticks);
++    if(semaphore_create(kernel_task,&bt_work,SYNC_POLICY_FIFO,0)!=KERN_SUCCESS) {bt_work=SEMAPHORE_NULL;e=ENOMEM;goto done;}
++    e=star_gpu_irq_request_threaded(BU_IRQ,bu_isr,NULL);
++    printf("STAR BT UART: IRQ %u (GIC SPI 0x260 level-high) threaded request error=%d\n",BU_IRQ,e);
++    if(e) goto done;
++    irq=true;
++    /* set_termios 115200 8N1 CRTSCTS + start_rx_sequencer (RX DMA 2048, START_READ | RFR_OPEN) */
++    bu_set_termios(115200,true);
++    printf("STAR BT UART: SE_DMA depth=%u status=%#x\n",depth,rd(uart,0x40));
++    e=bt_edl(0x19,"EDL_PATCH_VER_REQ");
++    if(!e) e=bt_edl(0x23,"EDL_GET_BID_REQ");
+     if(!e) {
+         uint64_t psize=0,nsize=0;
+         const uint8_t *patch=renoir_adsp_fw_file("bt-hpbtfw20.tlv",&psize),*nvm=renoir_adsp_fw_file("bt-hpnv20.bin",&nsize);
+@@ -452,7 +769,7 @@
+         } else {
+             printf("STAR BT FIRMWARE: rampatch %llu bytes download_mode=%u product=%#x rom=%#x patch=%#x; NVM %llu bytes\n",
+                 psize,patch[14],patch[16]|(patch[17]<<8),patch[18]|(patch[19]<<8),patch[20]|(patch[21]<<8),nsize);
+-            e=bt_download(uart,patch,(unsigned)psize,patch[14]==3,"RAMPATCH");
++            e=bt_download(patch,(unsigned)psize,patch[14]==3,"RAMPATCH");
+             if(!e) {
+                 bt_sleep_ms(10);
+                 memcpy(nvm_copy,nvm,nsize);
+@@ -460,40 +777,49 @@
+                 for(unsigned idx=0;idx+12<=length && 4+idx+12<=nsize;) {
+                     uint8_t *tag=nvm_copy+4+idx;unsigned id=tag[0]|(tag[1]<<8),len=tag[2]|(tag[3]<<8);
+                     if(4+idx+12+len>nsize) break;
+-                    if(id==17 && len>=3) {tag[12]|=0x80;tag[13]=0;++edits;}    /* IBS on, QCA_BAUDRATE_115200 */
+-                    if(id==27 && len>=1) {tag[12]|=0x01;++edits;}              /* deep sleep */
++                    if(id==17 && len>=3) {tag[12]|=0x80;tag[13]=0;++edits;}   /* IBS on, QCA_BAUDRATE_115200 */
++                    if(id==27 && len>=1) {tag[12]|=0x01;++edits;}                      /* deep sleep */
+                     idx+=12+len;
+                 }
+                 printf("STAR BT NVM: tag edits=%u (HCI in-band sleep + 115200, deep sleep)\n",edits);
+-                e=edits==2?bt_download(uart,nvm_copy,(unsigned)nsize,false,"NVM"):EINVAL;
++                e=edits==2?bt_download(nvm_copy,(unsigned)nsize,false,"NVM"):EINVAL;
+             }
+-            if(!e) {const uint8_t p[2]={0x14,0x00};e=bt_cmd(uart,0xfc17,p,2,-1,"DISABLE_SOC_LOGGING");}
+-            if(!e) e=bt_cmd(uart,0x0c03,NULL,0,-1,"HCI_RESET");
+-            if(!e) e=bt_edl(uart,0x20,"EDL_GET_BUILD_INFO");
++            if(!e) {const uint8_t p[2]={0x14,0x00};e=bt_cmd(0xfc17,p,2,-1,"DISABLE_SOC_LOGGING",true);}
++            if(!e) e=bt_cmd(0x0c03,NULL,0,-1,"HCI_RESET",true);
++            if(!e) e=bt_edl(0x20,"EDL_GET_BUILD_INFO");
+             if(!e) {
+                 /* qca_read_fw_build_info: data[0] is the label length */
+-                char label[64];unsigned n=bt_ev(8),len=bt_ev(2)+3;
++                char label[64];unsigned n=bw.ev[8],len=bw.ev_len;
+                 if(n>sizeof(label)-1) n=sizeof(label)-1;
+                 if(9+n>len) n=len>9?len-9:0;
+-                for(unsigned i=0;i<n;++i) label[i]=(char)bt_ev(9+i);
++                for(unsigned i=0;i<n;++i) label[i]=(char)bw.ev[9+i];
+                 label[n]=0;
+-                printf("STAR BT HCI SUMMARY: rampatch/NVM/HCI_Reset at 115200 done; firmware %s; UART kept for iOS\n",label);
+-                bt_service(uart,label);
++                printf("STAR BT HCI SUMMARY: rampatch/NVM/HCI_Reset at %u done; firmware %s\n",bu.cur_baud,label);
++                bw.ibs=true;bw.tx_ibs=TX_ASLEEP;bw.rx_awake=false;      /* clear_bit(QCA_IBS_DISABLED) */
++                uint8_t address[6];
++                if(bt_local_address(address)) {
++                    uint8_t swapped[6];
++                    for(unsigned i=0;i<6;++i) swapped[i]=address[5-i];       /* baswap */
++                    printf("STAR BT SERVICE: set_bdaddr %02x:%02x:%02x:%02x:%02x:%02x via EDL_WRITE_BD_ADDR\n",
++                        address[0],address[1],address[2],address[3],address[4],address[5]);
++                    e=bt_cmd(0xfc14,swapped,6,-1,"EDL_WRITE_BD_ADDR",true);
++                } else printf("STAR BT SERVICE: no ADT local-mac-address; controller keeps its NVM address\n");
++                if(!e) {
++                    renoir_bt_sk_boot_result(0,label);
++                    bt_service();
++                }
+             }
+         }
+     }
+ done:
+     renoir_bt_sk_boot_result(e?e:EIO,NULL);
+-    if(uart && rx_started) {
+-        /* stop_rx_sequencer: manual flow off, cancel S command, RX DMA FSM reset */
+-        bt_wr(uart,0x2ac,(1u<<31)|(1u<<1));delay(1500);
+-        bt_wr(uart,0x634,1u<<2);
+-        for(unsigned us=0;us<10000 && (rd(uart,0x40)&(1u<<12));us+=10) delay(10);
+-        bt_wr(uart,0x648,rd(uart,0x640));
+-        bt_wr(uart,0xd58,1);
+-        for(unsigned us=0;us<10000 && !(rd(uart,0xd40)&(1u<<3));us+=10) delay(10);
+-        bt_wr(uart,0xd44,rd(uart,0xd40));bt_wr(uart,0xe1c,0);
+-    }
++    if(irq) {
++        bu_stop_rx_sequencer();
++        bt_wr(uart,0x614,0);bt_wr(uart,0x644,0);bt_wr(uart,0xc50,~0u);bt_wr(uart,0xd50,~0u);bt_wr(uart,0xe1c,0);
++        star_gpu_irq_free(BU_IRQ);
++        bt_stats("setup failed");
++    }
++    if(bt_work) {semaphore_t s=bt_work;bt_work=SEMAPHORE_NULL;semaphore_destroy(kernel_task,s);}
+     if(powered) {bt_gpio_out(65,0);bt_sleep_ms(100);}
+     if(smmu||bts.published){renoir_dma_lock();bt_smmu_retire_locked();renoir_dma_unlock();}
+     while(clocks)star_gpu_clock_disable_unprepare(order[--clocks]);
+@@ -501,7 +827,7 @@
+     if(core){cleanup=star_gpu_icc_set(core,0,0);star_gpu_icc_put(core);}
+     if(ddr){int r=star_gpu_icc_set(ddr,0,0);if(r)cleanup=r;star_gpu_icc_put(ddr);}
+     if(uart) bt_unmap(uart,0x4000);
+-    printf("STAR BT HCI SUMMARY: error=%d cleanup=%d powered_then_off=%u smmu=%u; setup failed, no iOS transport\n",e,cleanup,powered,smmu);
++    printf("STAR BT HCI SUMMARY: error=%d cleanup=%d powered_then_off=%u smmu=%u irq=%u; setup failed, no iOS transport\n",e,cleanup,powered,smmu,irq);
+     thread_terminate_self();
+ }
+ static void renoir_bluetooth_hci_start(void)

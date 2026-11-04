@@ -1,0 +1,23 @@
+--- a/bsd/dev/renoir_bluetooth_probe.inc
++++ b/bsd/dev/renoir_bluetooth_probe.inc
+@@ -6,6 +6,8 @@
+ #include <sys/star_gpu_clock_provider.h>
+ #include <sys/star_gpu_icc.h>
+ #include <sys/errno.h>
++#include <vm/pmap.h>
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t,vm_size_t,uint32_t);
+ extern void ml_io_unmap(vm_offset_t,vm_size_t);
+ static void bt_unmap(vm_offset_t address,vm_size_t size)
+ {
+@@ -21,7 +23,10 @@
+     const enum star_gpu_clock_id order[]={STAR_CLK_QUP0_M_AHB,STAR_CLK_QUP0_S_AHB,STAR_CLK_SE7};
+     e=star_gpu_clock_qup0_open();if(e)goto done;
+     e=star_gpu_icc_get_qup0(&core,&ddr);if(e)goto done;
+-    uart=ml_io_map(0x99c000,0x4000);wrapper=ml_io_map(0x9c0000,0x2000);
++    /* XNU ml_io_map is permanent (io_submap). These two probe-owned
++     * windows are released below and must be allocated in kernel_map. */
++    uart=ml_io_map_unmappable(0x99c000,0x4000,VM_WIMG_IO);
++    wrapper=ml_io_map_unmappable(0x9c0000,0x2000,VM_WIMG_IO);
+     if(!uart||!wrapper){e=ENOMEM;goto done;}
+     e=star_gpu_icc_set(core,50000,100000);if(e)goto done;
+     e=star_gpu_icc_set(ddr,0,76800);if(e)goto done;

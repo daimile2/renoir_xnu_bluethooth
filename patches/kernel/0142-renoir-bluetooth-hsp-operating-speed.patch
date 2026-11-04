@@ -1,0 +1,222 @@
+--- a/bsd/dev/renoir_bluetooth_transport.inc
++++ b/bsd/dev/renoir_bluetooth_transport.inc
+@@ -19,6 +19,7 @@
+  * serial port, received bytes are discarded while no RX ring exists. With a
+  * ring, the owner only writes what fits (the UART then holds RFR). Queued
+  * TX and freed RX space signal the owner's worker semaphore (bt_work).
++ * The termios speed is the operating speed the bring-up configured.
+  * kern.renoir_bt_boot blocks until the kernel finished the QCA bring-up
+  * (BlueTool's "boot" script role) and returns 0 or its error;
+  * kern.renoir_bt_firmware is the controller's EDL build label. */
+@@ -35,8 +36,8 @@
+ #include <kern/sync_sema.h>
+ #include <kern/task.h>
+ #define BT_SK_FIFO 8192u
+-#define BT_SK_LINE_SPEED 115200u
+ static semaphore_t bt_work=SEMAPHORE_NULL;
++static uint32_t bt_sk_speed=115200;
+ static uint64_t bt_sk_kicks_tx,bt_sk_kicks_rx;
+ static void bt_kick(void)
+ {
+@@ -73,7 +74,7 @@
+     memset(&bt_sk.termios,0,sizeof(bt_sk.termios));
+     /* The hardware line: 8N1, CREAD, RTS/CTS. */
+     bt_sk.termios.cflag=0x300|0x800|0x8000|0x10000|0x20000;
+-    bt_sk.termios.ispeed=bt_sk.termios.ospeed=BT_SK_LINE_SPEED;
++    bt_sk.termios.ispeed=bt_sk.termios.ospeed=bt_sk_speed;
+ }
+ static void bt_sk_fifo_put(uint8_t *fifo,uint32_t head,uint32_t *len,const uint8_t *data,uint32_t n)
+ {
+@@ -316,9 +317,9 @@
+     if((uint32_t)opt==0x80487414u) {             /* TIOCSETA */
+         if(len!=sizeof(struct bt_termios64)) return EINVAL;
+         const struct bt_termios64 *t=data;
+-        /* The line is fixed at 8N1 RTS/CTS and the speed the NVM selected. */
++        /* The line is fixed at 8N1 RTS/CTS and the operating speed set in the bring-up. */
+         bool ok=(t->cflag&(0x300|0x400|0x1000))==0x300 && (t->cflag&0x30000)==0x30000 &&
+-            t->ispeed==BT_SK_LINE_SPEED && t->ospeed==BT_SK_LINE_SPEED;
++            t->ispeed==bt_sk_speed && t->ospeed==bt_sk_speed;
+         printf("STAR BT UART.SK: TIOCSETA cflag=%#llx speed=%llu/%llu %s\n",t->cflag,t->ispeed,t->ospeed,ok?"accepted":"unsupported");
+         if(!ok) return EINVAL;
+         lck_mtx_lock(&bt_sk_lock);bt_sk.termios=*t;lck_mtx_unlock(&bt_sk_lock);
+@@ -357,16 +358,18 @@
+ SYSCTL_PROC(_kern,OID_AUTO,renoir_bt_boot,CTLTYPE_INT|CTLFLAG_RD|CTLFLAG_LOCKED,NULL,0,bt_sk_boot_sysctl,"I","QCA6490 kernel bring-up result");
+ SYSCTL_STRING(_kern,OID_AUTO,renoir_bt_firmware,CTLFLAG_RD|CTLFLAG_LOCKED,bt_sk.firmware,sizeof(bt_sk.firmware),"QCA6490 firmware build label");
+ 
+-/* Called once by the UART owner: 0 after a complete bring-up, else errno. */
+-static void renoir_bt_sk_boot_result(int error,const char *firmware)
++/* Called once by the UART owner: 0 after a complete bring-up (with the
++ * UART speed it configured), else errno. */
++static void renoir_bt_sk_boot_result(int error,const char *firmware,uint32_t speed)
+ {
+     if(!error) {
++        bt_sk_speed=speed;
+         struct kern_ctl_reg reg={.ctl_flags=CTL_FLAG_REG_SOCK_STREAM,
+             .ctl_connect=bt_sk_connect,.ctl_disconnect=bt_sk_disconnect,.ctl_send=bt_sk_send,
+             .ctl_setopt=bt_sk_setopt,.ctl_getopt=bt_sk_getopt};
+         strlcpy(reg.ctl_name,"com.apple.uart.sk.bluetooth",sizeof(reg.ctl_name));
+         error=ctl_register(&reg,&bt_sk.ctl);
+-        printf("STAR BT UART.SK: ctl_register com.apple.uart.sk.bluetooth error=%d firmware=%s\n",error,firmware);
++        printf("STAR BT UART.SK: ctl_register com.apple.uart.sk.bluetooth error=%d firmware=%s speed=%u\n",error,firmware,speed);
+     }
+     lck_mtx_lock(&bt_sk_lock);
+     if(firmware) strlcpy(bt_sk.firmware,firmware,sizeof(bt_sk.firmware));
+--- a/bsd/dev/renoir_bluetooth_hci.inc
++++ b/bsd/dev/renoir_bluetooth_hci.inc
+@@ -17,15 +17,17 @@
+  *    qcom,iommu-dma-addr-pool 0x40000000), mapped like the Wi-Fi SID2401 bank.
+  *  - The SE interrupt (INTID 640) runs msm_geni_serial_handle_isr in a
+  *    thread (star_gpu_irq threaded adapter); one worker owns the H4 stream.
+- *  - At 115200: qca_read_soc_version's EDL_PATCH_VER_REQ (H4 01, opcode
+- *    0xfc00, 1 byte 0x19; device 20261103-161143: product 0x13, patch
+- *    0x17f3, ROM 0x0200, SoC 0x400c0200, i.e. hpbtfw20.tlv / hpnv20.*), then
+- *    qca_read_fw_board_id's EDL_GET_BID_REQ (0x23; board ID 0 -> hpnv20.bin);
+- *    qca_uart_setup at the init speed: rampatch TLV in 243-byte
+- *    EDL_PATCH_TLV_REQ segments (download_mode 3 = SKIP_EVT_VSE_CC: only the
+- *    last segment is acked), 10 ms, NVM with qca_tlv_check_data's edits
+- *    (HCI tag: in-band sleep bit, baud 115200; deep-sleep bit), every NVM
+- *    segment acked;
++ *  - qca_setup, WCN6855/HSP branch (Linux 05441d697f7f): at the init speed
++ *    115200 qca_read_soc_version's EDL_PATCH_VER_REQ (H4 01, opcode 0xfc00,
++ *    1 byte 0x19; device 20261103-161143: product 0x13, patch 0x17f3, ROM
++ *    0x0200, SoC 0x400c0200, i.e. hpbtfw20.tlv / hpnv20.*); qca_set_speed to
++ *    the operating speed, the ADT transport-speed (0xfc48 with the QCA baud
++ *    enum, flow control off/on around it, host termios via set_termios);
++ *    then qca_uart_setup: rampatch TLV in 243-byte EDL_PATCH_TLV_REQ
++ *    segments (download_mode 3 = SKIP_EVT_VSE_CC: only the last segment is
++ *    acked), 10 ms, EDL_GET_BID_REQ (board ID 0 -> hpnv20.bin), NVM with
++ *    qca_tlv_check_data's edits (HCI tag: in-band sleep bit, payload[1] =
++ *    the same baud enum; deep-sleep bit), every NVM segment acked;
+  *    qca_disable_soc_logging; HCI_Reset; qca_read_fw_build_info.
+  *    The files come from this phone's bluetooth_a partition via the boot
+  *    bundle (bt-hpbtfw20.tlv, bt-hpnv20.bin).
+@@ -683,6 +685,59 @@
+     absolutetime_to_nanoseconds(mach_absolute_time()-start,&ns);
+     printf("STAR BT %s: %u bytes in %u segments acked, %llu ms\n",name,size,segments,ns/NSEC_PER_MSEC);
+     return 0;
++}
++/* qca_get_baudrate_value */
++static uint8_t bt_qca_baudrate(uint32_t speed)
++{
++    switch(speed) {
++    case 9600: return 4;
++    case 19200: return 3;
++    case 38400: return 2;
++    case 57600: return 1;
++    case 230400: return 5;
++    case 460800: return 7;
++    case 500000: return 8;
++    case 921600: return 10;
++    case 1000000: return 11;
++    case 2000000: return 13;
++    case 3000000: return 14;
++    case 3200000: return 0x11;
++    case 3500000: return 0x12;
++    default: return 0;
++    }
++}
++/* The operating speed (hu->oper_speed): ADT /arm-io/bluetooth transport-speed,
++ * which bluetoothd also applies with cfsetspeed. */
++static uint32_t bt_oper_speed(void)
++{
++    DTEntry node;const void *data;unsigned length=0;
++    if(SecureDTLookupEntry(NULL,"/arm-io/bluetooth",&node)!=kSuccess ||
++       SecureDTGetProperty(node,"transport-speed",&data,&length)!=kSuccess || length!=4) return 0;
++    return *(const uint32_t *)data;
++}
++/* qca_set_speed(QCA_OPER_SPEED), WCN6855 branch, with the tty-path
++ * hci_uart_set_flow_control and hci_uart_set_baudrate. */
++static int bt_set_speed(uint32_t speed,uint8_t qca_baudrate)
++{
++    /* hci_uart_set_flow_control(hu, true): termios without CRTSCTS, then RTS off */
++    bu_set_termios(bu.cur_baud,false);
++    bu_set_mctrl(false);
++    /* qca_set_baudrate: queued, sent, CMD_TRANS_TIMEOUT for the UART to drain */
++    const uint8_t cmd[]={0x01,0x48,0xfc,0x01,qca_baudrate};
++    uint64_t deadline;clock_interval_to_deadline(10000,NSEC_PER_MSEC,&deadline);
++    int e=bt_send(cmd,sizeof(cmd),deadline);
++    if(!e) {
++        clock_interval_to_deadline(POLL_WAIT_TIMEOUT_MSEC,NSEC_PER_MSEC,&deadline);
++        while(!bu_tx_empty() && mach_absolute_time()<deadline) bt_pump(deadline);
++        bool sent=bu_tx_empty();
++        printf("STAR BT SPEED: 0xfc48 %#x %s at %u\n",qca_baudrate,sent?"sent":"not drained in 100 ms",bu.cur_baud);
++        bt_sleep_ms(1);                                          /* usleep_range(1000, 10000) */
++        bu_set_termios(speed,false);                             /* host_set_baudrate */
++    } else printf("STAR BT SPEED: 0xfc48 not queued (%d)\n",e);
++    /* hci_uart_set_flow_control(hu, false): RTS on, then termios with CRTSCTS */
++    bu_set_mctrl(true);
++    bu_set_termios(bu.cur_baud,true);
++    return e;
+ }
+ /* hci_dev_setup after hdev->setup: with a public address property the core
+  * calls hdev->set_bdaddr = qca_set_bdaddr (EDL_WRITE_BD_ADDR 0xfc14, the
+@@ -759,7 +814,11 @@
+     bu_set_termios(115200,true);
+     printf("STAR BT UART: SE_DMA depth=%u status=%#x\n",depth,rd(uart,0x40));
+     e=bt_edl(0x19,"EDL_PATCH_VER_REQ");
+-    if(!e) e=bt_edl(0x23,"EDL_GET_BID_REQ");
++    uint32_t speed=bt_oper_speed();uint8_t qca_baudrate=0;            /* QCA_BAUDRATE_115200 */
++    if(!e && speed) {
++        qca_baudrate=bt_qca_baudrate(speed);
++        e=bt_set_speed(speed,qca_baudrate);
++    }
+     if(!e) {
+         uint64_t psize=0,nsize=0;
+         const uint8_t *patch=renoir_adsp_fw_file("bt-hpbtfw20.tlv",&psize),*nvm=renoir_adsp_fw_file("bt-hpnv20.bin",&nsize);
+@@ -767,21 +826,23 @@
+         if(!patch || !nvm || psize<28 || nsize<16 || nsize>sizeof(nvm_copy) || patch[0]!=1 || nvm[0]!=2) {
+             printf("STAR BT FIRMWARE: bundle has no valid bt-hpbtfw20.tlv/bt-hpnv20.bin (%llu/%llu bytes)\n",psize,nsize);e=ENOENT;
+         } else {
+-            printf("STAR BT FIRMWARE: rampatch %llu bytes download_mode=%u product=%#x rom=%#x patch=%#x; NVM %llu bytes\n",
+-                psize,patch[14],patch[16]|(patch[17]<<8),patch[18]|(patch[19]<<8),patch[20]|(patch[21]<<8),nsize);
++            printf("STAR BT FIRMWARE: rampatch %llu bytes download_mode=%u product=%#x rom=%#x patch=%#x; NVM %llu bytes; UART %u (QCA baud %#x)\n",
++                psize,patch[14],patch[16]|(patch[17]<<8),patch[18]|(patch[19]<<8),patch[20]|(patch[21]<<8),nsize,bu.cur_baud,qca_baudrate);
+             e=bt_download(patch,(unsigned)psize,patch[14]==3,"RAMPATCH");
+             if(!e) {
+                 bt_sleep_ms(10);
++                /* WCN6855 NVM name: qca_read_fw_board_id; its failure leaves board ID 0 */
++                if(!bt_edl(0x23,"EDL_GET_BID_REQ")) printf("STAR BT FIRMWARE: board ID %#x -> hpnv20.bin\n",bw.ev_len>=11?(bw.ev[9]<<8)|bw.ev[10]:0);
+                 memcpy(nvm_copy,nvm,nsize);
+                 unsigned length=(nvm_copy[1]|(nvm_copy[2]<<8)|(nvm_copy[3]<<16)),edits=0;
+                 for(unsigned idx=0;idx+12<=length && 4+idx+12<=nsize;) {
+                     uint8_t *tag=nvm_copy+4+idx;unsigned id=tag[0]|(tag[1]<<8),len=tag[2]|(tag[3]<<8);
+                     if(4+idx+12+len>nsize) break;
+-                    if(id==17 && len>=3) {tag[12]|=0x80;tag[13]=0;++edits;}   /* IBS on, QCA_BAUDRATE_115200 */
++                    if(id==17 && len>=3) {tag[12]|=0x80;tag[13]=qca_baudrate;++edits;}   /* IBS on, user baud */
+                     if(id==27 && len>=1) {tag[12]|=0x01;++edits;}                      /* deep sleep */
+                     idx+=12+len;
+                 }
+-                printf("STAR BT NVM: tag edits=%u (HCI in-band sleep + 115200, deep sleep)\n",edits);
++                printf("STAR BT NVM: tag edits=%u (HCI in-band sleep + baud %#x, deep sleep)\n",edits,qca_baudrate);
+                 e=edits==2?bt_download(nvm_copy,(unsigned)nsize,false,"NVM"):EINVAL;
+             }
+             if(!e) {const uint8_t p[2]={0x14,0x00};e=bt_cmd(0xfc17,p,2,-1,"DISABLE_SOC_LOGGING",true);}
+@@ -805,14 +866,14 @@
+                     e=bt_cmd(0xfc14,swapped,6,-1,"EDL_WRITE_BD_ADDR",true);
+                 } else printf("STAR BT SERVICE: no ADT local-mac-address; controller keeps its NVM address\n");
+                 if(!e) {
+-                    renoir_bt_sk_boot_result(0,label);
++                    renoir_bt_sk_boot_result(0,label,bu.cur_baud);
+                     bt_service();
+                 }
+             }
+         }
+     }
+ done:
+-    renoir_bt_sk_boot_result(e?e:EIO,NULL);
++    renoir_bt_sk_boot_result(e?e:EIO,NULL,0);
+     if(irq) {
+         bu_stop_rx_sequencer();
+         bt_wr(uart,0x614,0);bt_wr(uart,0x644,0);bt_wr(uart,0xc50,~0u);bt_wr(uart,0xd50,~0u);bt_wr(uart,0xe1c,0);
+@@ -834,8 +895,8 @@
+ {
+     int enabled=1;
+     PE_parse_boot_argn("renoirbt",&enabled,sizeof(enabled));
+-    if(!enabled) {renoir_bt_sk_boot_result(ENODEV,NULL);return;}
++    if(!enabled) {renoir_bt_sk_boot_result(ENODEV,NULL,0);return;}
+     thread_t thread;
+     if(kernel_thread_start(renoir_bluetooth_hci_run,NULL,&thread)==KERN_SUCCESS) thread_deallocate(thread);
+-    else {printf("STAR BT HCI: worker not started\n");renoir_bt_sk_boot_result(ENOMEM,NULL);}
+-}
++    else {printf("STAR BT HCI: worker not started\n");renoir_bt_sk_boot_result(ENOMEM,NULL,0);}
++}

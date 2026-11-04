@@ -1,0 +1,43 @@
+--- a/bsd/kern/sweet_network_privileges.inc
++++ b/bsd/kern/sweet_network_privileges.inc
+@@ -6,7 +6,7 @@
+  * exec replaces it from the new vnode, including dropping inherited grants.
+  */
+ static int sweet_network_slot;
+-enum {SWEET_NETWORK_DELEGATE=1, SWEET_NETWORK_RESOLVER=2, SWEET_GLOBAL_PROC_INFO=4};
++enum {SWEET_NETWORK_DELEGATE=1, SWEET_NETWORK_RESOLVER=2, SWEET_GLOBAL_PROC_INFO=4, SWEET_SKYWALK_USER_PIPE=8};
+ 
+ static uintptr_t
+ sweet_network_bits(struct vnode *vp, off_t offset)
+@@ -26,6 +26,11 @@
+ 	 * aggregated is signed with it; PowerLog runs as mobile, not root. */
+ 	if (sweet_entitlements_bool(ent, "com.apple.private.kernel.global-proc-info")) {
+ 		bits |= SWEET_GLOBAL_PROC_INFO;
++	}
++	/* nxprov_create() checks PRIV_SKYWALK_REGISTER_USER_PIPE for user-pipe
++	 * providers; 20H392 bluetoothd is signed with it for the A2DP audio pipe. */
++	if (sweet_entitlements_bool(ent, "com.apple.private.skywalk.register-user-pipe")) {
++		bits |= SWEET_SKYWALK_USER_PIPE;
+ 	}
+ 	return bits;
+ }
+@@ -55,9 +60,9 @@
+ 	mac_label_set(mac_cred_label(new), sweet_network_slot, bits);
+ 	if (bits) {
+ 		char name[32];proc_name(proc_pid(p), name, sizeof(name));
+-		printf("STAR NET PRIV: exec pid=%d name=%s delegate=%u resolver=%u global_proc_info=%u\n",
++		printf("STAR NET PRIV: exec pid=%d name=%s delegate=%u resolver=%u global_proc_info=%u user_pipe=%u\n",
+ 		    proc_pid(p), name, !!(bits&SWEET_NETWORK_DELEGATE), !!(bits&SWEET_NETWORK_RESOLVER),
+-		    !!(bits&SWEET_GLOBAL_PROC_INFO));
++		    !!(bits&SWEET_GLOBAL_PROC_INFO), !!(bits&SWEET_SKYWALK_USER_PIPE));
+ 	}
+ 	return 0;
+ }
+@@ -68,5 +73,6 @@
+ 	uintptr_t bits = mac_label_get(mac_cred_label(cred), sweet_network_slot);
+ 	return (priv == PRIV_NET_PRIVILEGED_SOCKET_DELEGATE && (bits&SWEET_NETWORK_DELEGATE)) ||
+ 	       (priv == PRIV_NET_VALIDATED_RESOLVER && (bits&SWEET_NETWORK_RESOLVER)) ||
+-	       (priv == PRIV_GLOBAL_PROC_INFO && (bits&SWEET_GLOBAL_PROC_INFO));
++	       (priv == PRIV_GLOBAL_PROC_INFO && (bits&SWEET_GLOBAL_PROC_INFO)) ||
++	       (priv == PRIV_SKYWALK_REGISTER_USER_PIPE && (bits&SWEET_SKYWALK_USER_PIPE));
+ }

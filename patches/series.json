@@ -1,0 +1,152 @@
+{
+  "schema": 1,
+  "target": "renoir / QCA6490 / XNU 8796.141.3 / iOS 20H392",
+  "source_repository": "https://github.com/daimile2/ios-renoir",
+  "source_commit": "161a1ba60f2d4528caf784b09730d6217a819ca1",
+  "baseline": "Renoir port after kernel-series 0001..0128; legacy xnu/patches/0140 preflight already included",
+  "baseline_scope": "kernel/base contains only the 10 touched prerequisite files; this is a patch-validation fixture, not a complete kernel",
+  "unrelated_patches_excluded": [
+    131,
+    132,
+    139
+  ],
+  "patches": [
+    {
+      "file": "kernel/0129-renoir-bluetooth-geni-native-resources.patch",
+      "sha256": "97cdd5a98d1786cc555c31d7f36d28567dc729695fbb5e71d3bb8be7ad69af75",
+      "source_path": "gpu/kernel-patches/0129-renoir-bluetooth-geni-native-resources.patch",
+      "targets": [
+        "bsd/dev/star_gpu_clock.c",
+        "bsd/sys/star_gpu_clock.h",
+        "bsd/dev/star_gpu_clock_provider.c",
+        "bsd/sys/star_gpu_clock_provider.h",
+        "bsd/dev/star_gpu_icc.c",
+        "bsd/sys/star_gpu_icc.h",
+        "bsd/dev/renoir_bluetooth_probe.inc"
+      ]
+    },
+    {
+      "file": "kernel/0130-renoir-bluetooth-unmappable-probe-windows.patch",
+      "sha256": "90a73565baebc93bfbaf8632a913d56521270ae49e93189d7df1569c48991877",
+      "source_path": "gpu/kernel-patches/0130-renoir-bluetooth-unmappable-probe-windows.patch",
+      "targets": [
+        "bsd/dev/renoir_bluetooth_probe.inc"
+      ]
+    },
+    {
+      "file": "kernel/0133-renoir-bluetooth-power-uart-dma-identity-query.patch",
+      "sha256": "60096eb57eeb4e9f5289a02071633967a788becbdea2bd3e164498a30def2c7f",
+      "source_path": "gpu/kernel-patches/0133-renoir-bluetooth-power-uart-dma-identity-query.patch",
+      "targets": [
+        "bsd/dev/renoir_bluetooth_hci.inc",
+        "bsd/dev/renoir_bluetooth_probe.inc",
+        "bsd/dev/renoir_wifi.c",
+        "bsd/dev/renoir_wifi_qrtr_probe.inc"
+      ]
+    },
+    {
+      "file": "kernel/0134-renoir-bluetooth-dma-contiguity-at-xnu-page-size.patch",
+      "sha256": "72e308ce6f129c1f4444e2147d7b7428bb36322bbcb37675b7958bab31239715",
+      "source_path": "gpu/kernel-patches/0134-renoir-bluetooth-dma-contiguity-at-xnu-page-size.patch",
+      "targets": [
+        "bsd/dev/renoir_bluetooth_hci.inc"
+      ]
+    },
+    {
+      "file": "kernel/0135-renoir-bluetooth-board-id-query.patch",
+      "sha256": "dcf5a50828bc5460ff87dd3f61a3d933ce9e653724218c7bf14ddcbf3f9554b9",
+      "source_path": "gpu/kernel-patches/0135-renoir-bluetooth-board-id-query.patch",
+      "targets": [
+        "bsd/dev/renoir_bluetooth_hci.inc"
+      ]
+    },
+    {
+      "file": "kernel/0136-renoir-bluetooth-rampatch-nvm-reset.patch",
+      "sha256": "7e5c67dc4e83af19c0f6d5b01aeeb1f18fa28c955d6d08611c074d81affa078d",
+      "source_path": "gpu/kernel-patches/0136-renoir-bluetooth-rampatch-nvm-reset.patch",
+      "targets": [
+        "bsd/dev/renoir_bluetooth_hci.inc"
+      ]
+    },
+    {
+      "file": "kernel/0137-renoir-bluetooth-uart-skywalk-transport-ibs.patch",
+      "sha256": "5f53d1f9de3fd119acc230dea2eb35cedb4170007332589958c139df21308765",
+      "source_path": "gpu/kernel-patches/0137-renoir-bluetooth-uart-skywalk-transport-ibs.patch",
+      "targets": [
+        "bsd/dev/renoir_bluetooth_transport.inc",
+        "bsd/dev/renoir_wifi.c",
+        "bsd/dev/renoir_bluetooth_hci.inc"
+      ]
+    },
+    {
+      "file": "kernel/0138-renoir-bluetooth-set-bdaddr-from-adt.patch",
+      "sha256": "da50206dac8c1ad8ac9487c86482612b09d86f60a0194a014512a6bb93a00c04",
+      "source_path": "gpu/kernel-patches/0138-renoir-bluetooth-set-bdaddr-from-adt.patch",
+      "targets": [
+        "bsd/dev/renoir_bluetooth_hci.inc"
+      ]
+    },
+    {
+      "file": "kernel/0140-renoir-skywalk-user-pipe-entitlement.patch",
+      "sha256": "f7909994bef765d3ab74d1674b350163ccb7d3673fa7cd278bf6ff73ccf109cc",
+      "source_path": "gpu/kernel-patches/0140-renoir-skywalk-user-pipe-entitlement.patch",
+      "targets": [
+        "bsd/kern/sweet_network_privileges.inc"
+      ]
+    },
+    {
+      "file": "kernel/0141-renoir-bluetooth-uart-irq-dma-event-worker.patch",
+      "sha256": "bb583fec3f5c52230106d2b5a4e2ad0e02a14b70263b13cfbb5df775ffd446c5",
+      "source_path": "gpu/kernel-patches/0141-renoir-bluetooth-uart-irq-dma-event-worker.patch",
+      "targets": [
+        "bsd/dev/renoir_bluetooth_transport.inc",
+        "bsd/dev/renoir_bluetooth_hci.inc"
+      ]
+    },
+    {
+      "file": "kernel/0142-renoir-bluetooth-hsp-operating-speed.patch",
+      "sha256": "3f8af05391febbd02e6d8a8aaa54f6bc3073648908b9de6099df95f1d4d9d893",
+      "source_path": "gpu/kernel-patches/0142-renoir-bluetooth-hsp-operating-speed.patch",
+      "targets": [
+        "bsd/dev/renoir_bluetooth_transport.inc",
+        "bsd/dev/renoir_bluetooth_hci.inc"
+      ]
+    },
+    {
+      "file": "kernel/0143-renoir-bluetooth-worker-completion-before-wait.patch",
+      "sha256": "2fd59de748ce177ade0f82e1ced9ec7e6774b9b294b7ebdb13c4177e27e044e0",
+      "source_path": "gpu/kernel-patches/0143-renoir-bluetooth-worker-completion-before-wait.patch",
+      "targets": [
+        "bsd/dev/renoir_bluetooth_hci.inc"
+      ]
+    }
+  ],
+  "base_sha256": {
+    "bsd/dev/renoir_bluetooth_hci.inc": null,
+    "bsd/dev/renoir_bluetooth_probe.inc": "dd14e2d29ed69c6281f598e2922abbb1da04b449f1d5cede588a7591afd77aef",
+    "bsd/dev/renoir_bluetooth_transport.inc": null,
+    "bsd/dev/renoir_wifi.c": "c8744161243027ea6f1dac2560e02a68eb36135d19d3305e93f9b9510e12b082",
+    "bsd/dev/renoir_wifi_qrtr_probe.inc": "ba4f8f4d2064e4848e17fc98800fff00ebe89f6899cdf1edfc49a28a7f58a74e",
+    "bsd/dev/star_gpu_clock.c": "0c1444671e8c7246292915826be8bc6948e0675525dbc8a9a27add2787f760bf",
+    "bsd/dev/star_gpu_clock_provider.c": "bfb653e4448e54772e560c06e4b1a5f5b13a55a9e9f8d991b03ada06e2cd90ed",
+    "bsd/dev/star_gpu_icc.c": "ab19eb817cfc8cf12d2d08f40ab38ac4b7b0f525f132353574a4df531f6aa0dc",
+    "bsd/kern/sweet_network_privileges.inc": "794b09e141777a90a41888c30e380df1dc4d4b161ce5e702ca3db57eb6822022",
+    "bsd/sys/star_gpu_clock.h": "50f900ca0843bb56bc191cba79f8a264939731ae9f1c9f6afdebe8e32245db07",
+    "bsd/sys/star_gpu_clock_provider.h": "64ba2585ad9eff003b3582e303271306878f1ae66559e35d55c5f85a483d1f77",
+    "bsd/sys/star_gpu_icc.h": "a374148dbb7471e02926fbcdeccdad7cd89c7d3ff9b34e0b23f88691bb8dea66"
+  },
+  "result_sha256": {
+    "bsd/dev/renoir_bluetooth_hci.inc": "027108d7e05770811752b1bbbb46fff4bd8048a3d999d2167b06f53844413871",
+    "bsd/dev/renoir_bluetooth_probe.inc": "e1e710b9c94be2de5edd08bdc1c12cee7d7b31e655004b3414828317f3d38ed9",
+    "bsd/dev/renoir_bluetooth_transport.inc": "228c4f681e59f485b911651f0ca24cdb54cc61ea79d59cb7af53b71ab6b8785e",
+    "bsd/dev/renoir_wifi.c": "611710643546f18963fba2511332b2fdf8c2d105fc12b2ab00125923d649b9a2",
+    "bsd/dev/renoir_wifi_qrtr_probe.inc": "b11120edd52a209c7cc585ec7703305842c1eb07b8df1a8765b679c98b88906f",
+    "bsd/dev/star_gpu_clock.c": "5ca8d6284d978b461104dac027c42b45ab0cf526ead1ed7e9fd71f718d8e6524",
+    "bsd/dev/star_gpu_clock_provider.c": "09ae861b77b71e4bd3d2f891c26f416b82ec6cbbcebe3d5e10c146fab85cb54d",
+    "bsd/dev/star_gpu_icc.c": "961ae05deae497e2c5babadf307660e45de03330c74b5ea27792ecbb9008a1d2",
+    "bsd/kern/sweet_network_privileges.inc": "d200ab94957d3084b595b5b2f774e3ab9ac09da990d099809a1c1d96b7a445f1",
+    "bsd/sys/star_gpu_clock.h": "06ef869b75c643290c8c97f43d1f946441bf7617fc6cc54d5a5fa495d481382a",
+    "bsd/sys/star_gpu_clock_provider.h": "8894a386b4d31b6b61d8b62362a9bcd2ebf080842d5b6666af8743021c607a22",
+    "bsd/sys/star_gpu_icc.h": "3cadd37ee260cf01e782f1d548f53ddf651bdf19925d3573a2679a3dd78a6edd"
+  }
+}

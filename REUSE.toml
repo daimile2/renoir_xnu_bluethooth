@@ -1,0 +1,25 @@
+version = 1
+
+[[annotations]]
+path = ["README.md", "NOTICE.md", "CONTRIBUTING.md", "REUSE.toml", ".gitignore", ".gitattributes", "provenance.json", "docs/**", "config/**", ".github/**", "tools/**", "tests/**", "userland/**", "patches/series.json"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 daimile2 and contributors"
+SPDX-License-Identifier = "BSD-3-Clause"
+
+[[annotations]]
+path = ["kernel/base/bsd/dev/**", "kernel/base/bsd/sys/**", "kernel/files/bsd/dev/renoir_bluetooth_probe.inc", "kernel/files/bsd/dev/renoir_bluetooth_hci.inc", "patches/history/**", "patches/kernel/0129-*", "patches/kernel/0130-*", "patches/kernel/0133-*", "patches/kernel/0134-*", "patches/kernel/0135-*", "patches/kernel/0136-*", "patches/kernel/0138-*", "patches/kernel/0143-*"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 daimile2 and contributors; existing upstream notices retained in each file"
+SPDX-License-Identifier = "GPL-2.0-only"
+
+[[annotations]]
+path = ["kernel/base/bsd/kern/sweet_network_privileges.inc", "kernel/files/bsd/dev/renoir_bluetooth_transport.inc", "patches/kernel/0140-*"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 daimile2 and contributors; Apple XNU interface provenance in NOTICE.md"
+SPDX-License-Identifier = "APSL-2.0"
+
+[[annotations]]
+path = ["patches/kernel/0137-*", "patches/kernel/0141-*", "patches/kernel/0142-*"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 daimile2 and contributors; upstream notices retained by target file"
+SPDX-License-Identifier = "GPL-2.0-only AND APSL-2.0"

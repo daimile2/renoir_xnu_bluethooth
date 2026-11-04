@@ -1,0 +1,46 @@
+diff --git a/bsd/dev/renoir_bluetooth_probe.inc b/bsd/dev/renoir_bluetooth_probe.inc
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/renoir_bluetooth_probe.inc
+@@ -0,0 +1,22 @@
++/* QCA6490 Bluetooth preflight from renoir-live.dts: hsuart0 SE7,
++ * GPIO65 BT_EN, GPIO91 SW_CTRL, UART CTS/RTS/TX/RX68..71.
++ * Read-only TLMM/GCC inventory. No GPIO/clock votes, UART FIFO reads,
++ * reset/HCI/firmware writes or claims that an iOS transport is registered. */
++static void
++renoir_bluetooth_preflight(vm_offset_t gcc)
++{
++    static const unsigned pins[]={65,91,68,69,70,71};
++    printf("RENOIR BT PROFILE: QCA6490 UART=0x99c000 CTS68 RTS69 TX70 RX71 EN65 SW91; read-only\n");
++    bool mapped=true,enabled=false;
++    for(unsigned i=0;i<sizeof(pins)/sizeof(pins[0]);++i) {
++        vm_offset_t gpio=ml_io_map(0x0f100000+pins[i]*0x1000,0x1000);
++        if(!gpio) {mapped=false;continue;}
++        uint32_t cfg=rd(gpio,0),io=rd(gpio,4);
++        printf("RENOIR BT GPIO: pin=%u cfg=%#x io=%#x function=%u output=%u\n",pins[i],cfg,io,(cfg>>2)&15,(cfg>>9)&1);
++        if(pins[i]==65) enabled=(cfg&(1u<<9)) && !(cfg&0x3c) && (io&2);
++    }
++    uint32_t branch=rd(gcc,0x1785c),source=rd(gcc,0x17860),votes=rd(gcc,0x52008);
++    printf("RENOIR BT AHB: master=%#x slave=%#x\n",rd(gcc,0x17004),rd(gcc,0x17008));
++    printf("RENOIR BT CLOCK: SE7 branch=%#x source=%#x votes=%#x halted=%u\n",branch,source,votes,branch>>31);
++    printf("RENOIR BT SUMMARY: gpio_maps=%u enabled=%u se_clock=%u uart_untouched=1 hci=0; shared rails require managed ownership before power-up\n",mapped,enabled,!(branch>>31));
++}
+diff --git a/bsd/dev/renoir_wifi.c b/bsd/dev/renoir_wifi.c
+--- a/bsd/dev/renoir_wifi.c
++++ b/bsd/dev/renoir_wifi.c
+@@ -28,6 +28,7 @@
+         *(const uint32_t *)data==expected;
+ }
+ 
++#include "renoir_bluetooth_probe.inc"
+ #include "renoir_pcie_start.inc"
+ 
+ void
+@@ -48,6 +49,7 @@
+     vm_offset_t gcc=ml_io_map(0x00100000,0x1f0000);
+     vm_offset_t gpio=ml_io_map(0x0f140000,0x1000); /* TLMM GPIO64 */
+     if(!gcc || !gpio) { printf("RENOIR WIFI PCIE: map failed\n");return; }
++    renoir_bluetooth_preflight(gcc);
+     uint32_t power=rd(gcc,0x6b004),reset=rd(gcc,0x6b000),phy_reset=rd(gcc,0x6c01c);
+     uint32_t votes=rd(gcc,0x52008),config=rd(gpio,0),inout=rd(gpio,4);
+     printf("RENOIR WIFI PCIE POWER: gdsc=%#x reset=%#x phyreset=%#x votes=%#x GPIO64 cfg=%#x io=%#x\n",

@@ -1,0 +1,12 @@
+--- a/bsd/dev/renoir_bluetooth_hci.inc
++++ b/bsd/dev/renoir_bluetooth_hci.inc
+@@ -77,7 +77,8 @@
+     if(!bp || !tp) BT_FAIL("physical address");
+     bts.pa=ptoa_64(bp);bts.table_pa=ptoa_64(tp);
+     if((bts.pa&0x3fff) || (bts.table_pa&0x3fff) || bts.pa+BT_DMA_BYTES>(1ULL<<36) || bts.table_pa+0x4000>(1ULL<<36)) BT_FAIL("alignment/range");
+-    for(unsigned page=0;page<BT_DMA_BYTES/0x1000;++page)
++    /* pmap_find_phys returns XNU 16 KiB pages: compare at that granule (as Wi-Fi's page&3). */
++    for(unsigned page=0;page<BT_DMA_BYTES/0x1000;page+=PAGE_SIZE/0x1000)
+         if(ptoa_64(pmap_find_phys(kernel_pmap,(addr64_t)(bts.buffer+0x1000ULL*page)))!=bts.pa+0x1000ULL*page) BT_FAIL("not contiguous");
+     flush_dcache64((addr64_t)bts.table_pa,0x4000,TRUE);
+     flush_dcache64((addr64_t)bts.pa,BT_DMA_BYTES,TRUE);

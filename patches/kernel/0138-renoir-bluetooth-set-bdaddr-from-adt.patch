@@ -1,0 +1,107 @@
+--- a/bsd/dev/renoir_bluetooth_hci.inc
++++ b/bsd/dev/renoir_bluetooth_hci.inc
+@@ -272,16 +272,44 @@
+ #define HCI_IBS_WAKE_IND 0xfd
+ #define HCI_IBS_WAKE_ACK 0xfc
+ #define QCA_DEBUG_HANDLE 0x2edc
+-static __attribute__((noreturn)) void bt_service(vm_offset_t uart)
++/* hci_dev_setup after hdev->setup: with a public address property the core
++ * calls hdev->set_bdaddr = qca_set_bdaddr (EDL_WRITE_BD_ADDR 0xfc14, the
++ * address byte-swapped, __hci_cmd_sync_ev for HCI_INIT_TIMEOUT) before the
++ * device is up. IBS is already enabled then, so it goes through the same
++ * qca_enqueue path; its command complete stays in the kernel. The address
++ * is the ADT's /arm-io/bluetooth local-mac-address (display byte order). */
++static bool bt_local_address(uint8_t address[6])
++{
++    DTEntry node;const void *data;unsigned length=0;
++    if(SecureDTLookupEntry(NULL,"/arm-io/bluetooth",&node)!=kSuccess ||
++       SecureDTGetProperty(node,"local-mac-address",&data,&length)!=kSuccess || length!=6) return false;
++    memcpy(address,data,6);
++    for(unsigned i=0;i<6;++i) if(address[i]) return true;
++    return false;
++}
++static __attribute__((noreturn)) void bt_service(vm_offset_t uart,const char *label)
+ {
+     enum {TX_ASLEEP,TX_WAKING,TX_AWAKE} tx_ibs=TX_ASLEEP;
+     bool rx_awake=false,armed=false;
+     uint8_t type=0,hdr[4];unsigned need=0,got=0,body=0;bool drop=false;
+-    static uint8_t out[0x1000],in[2048];
+-    uint64_t retrans=0,idle=0,retrans_ticks,idle_ticks;
++    static uint8_t out[0x1000],in[2048],event[2+255];
++    unsigned event_len=0;
++    uint64_t retrans=0,idle=0,retrans_ticks,idle_ticks,init_ticks,deadline=0;
+     nanoseconds_to_absolutetime(100*NSEC_PER_MSEC,&retrans_ticks);
+     nanoseconds_to_absolutetime(2000*NSEC_PER_MSEC,&idle_ticks);
++    nanoseconds_to_absolutetime(10000*NSEC_PER_MSEC,&init_ticks);
+     uint64_t wakes=0,wacks=0,slps=0,recv_wakes=0,recv_wacks=0,recv_slps=0,diag=0,bad=0;
++    uint8_t address[6],command[4+6];bool command_pending=false,awaiting=false;
++    if(bt_local_address(address)) {
++        command[0]=1;command[1]=0x14;command[2]=0xfc;command[3]=6;
++        for(unsigned i=0;i<6;++i) command[4+i]=address[5-i];      /* baswap */
++        command_pending=true;
++        printf("STAR BT SERVICE: set_bdaddr %02x:%02x:%02x:%02x:%02x:%02x via EDL_WRITE_BD_ADDR\n",
++            address[0],address[1],address[2],address[3],address[4],address[5]);
++    } else {
++        printf("STAR BT SERVICE: no ADT local-mac-address; controller keeps its NVM address\n");
++        renoir_bt_sk_boot_result(0,label);
++    }
+     printf("STAR BT SERVICE: UART owned, IBS tx/rx ASLEEP, wake_retrans=100 ms tx_idle=2000 ms, 1 ms poll\n");
+     for(;;) {
+         unsigned n_out=0;
+@@ -316,21 +344,42 @@
+                     body=type==4?hdr[1]:type==3?hdr[2]:type==2?(unsigned)(hdr[2]|(hdr[3]<<8)):(unsigned)((hdr[2]|(hdr[3]<<8))&0x3fff);
+                     drop=type==2 && (hdr[0]|(hdr[1]<<8))==QCA_DEBUG_HANDLE;
+                     if(drop) ++diag;
++                    else if(type==4) {event[0]=hdr[0];event[1]=hdr[1];event_len=2;}
+                     else {renoir_bt_sk_rx_put(&type,1);renoir_bt_sk_rx_put(hdr,got);}
++                    if(body) continue;
++                } else {
++                    unsigned n=len-i<body?len-i:body;
++                    if(type==4) {memcpy(event+event_len,in+i,n);event_len+=n;}
++                    else if(!drop) renoir_bt_sk_rx_put(in+i,n);
++                    i+=n;body-=n;
++                    if(body) continue;
++                }
++                if(type!=4) continue;
++                /* A complete event: the set_bdaddr reply is consumed here. */
++                if(awaiting && event[0]==0x0e && event_len>=6 && event[3]==0x14 && event[4]==0xfc) {
++                    awaiting=false;
++                    printf("STAR BT SERVICE: EDL_WRITE_BD_ADDR status=%#x\n",event[5]);
++                    renoir_bt_sk_boot_result(event[5]?EIO:0,label);
+                     continue;
+                 }
+-                unsigned n=len-i<body?len-i:body;
+-                if(!drop) renoir_bt_sk_rx_put(in+i,n);
+-                i+=n;body-=n;
++                renoir_bt_sk_rx_put(&type,1);renoir_bt_sk_rx_put(event,event_len);
+             }
+         }
+         uint64_t now=mach_absolute_time();
++        if(awaiting && now>=deadline) {
++            awaiting=false;printf("STAR BT SERVICE: EDL_WRITE_BD_ADDR no reply in 10 s\n");
++            renoir_bt_sk_boot_result(ETIMEDOUT,label);
++        }
+         if(tx_ibs==TX_WAKING && now>=retrans) {out[n_out++]=HCI_IBS_WAKE_IND;++wakes;retrans=now+retrans_ticks;}
+         if(tx_ibs==TX_AWAKE && now>=idle) {out[n_out++]=HCI_IBS_SLEEP_IND;++slps;tx_ibs=TX_ASLEEP;}
+-        if(renoir_bt_sk_tx_pending()) {
++        if(command_pending || renoir_bt_sk_tx_pending()) {
+             if(tx_ibs==TX_ASLEEP) {
+                 tx_ibs=TX_WAKING;out[n_out++]=HCI_IBS_WAKE_IND;++wakes;retrans=now+retrans_ticks;
+             } else if(tx_ibs==TX_AWAKE) {
++                if(command_pending) {
++                    memcpy(out+n_out,command,sizeof(command));n_out+=sizeof(command);
++                    command_pending=false;awaiting=true;deadline=now+init_ticks;
++                }
+                 n_out+=renoir_bt_sk_tx_take(out+n_out,sizeof(out)-n_out);
+                 idle=now+idle_ticks;
+             }
+@@ -429,8 +478,7 @@
+                 for(unsigned i=0;i<n;++i) label[i]=(char)bt_ev(9+i);
+                 label[n]=0;
+                 printf("STAR BT HCI SUMMARY: rampatch/NVM/HCI_Reset at 115200 done; firmware %s; UART kept for iOS\n",label);
+-                renoir_bt_sk_boot_result(0,label);
+-                bt_service(uart);
++                bt_service(uart,label);
+             }
+         }
+     }
